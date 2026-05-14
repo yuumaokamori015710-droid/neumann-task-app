@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import {
   Plus, Pencil, Trash2, Check, Calendar, Download,
-  AlertTriangle, X, BookOpen, List, BarChart2,
+  AlertTriangle, X, BookOpen, List, BarChart2, Users,
 } from 'lucide-react'
 
 // ============================================================
@@ -9,16 +9,13 @@ import {
 // ============================================================
 
 type Priority = 'high' | 'medium' | 'low'
-type Filter = 'all' | 'today' | 'thisWeek' | 'overdue'
-type ViewMode = 'list' | 'gantt'
+type Filter   = 'all' | 'today' | 'thisWeek' | 'overdue'
+type ViewMode = 'list' | 'gantt' | 'assignee'
 
 interface CompletionCondition {
-  verb: string
-  verbCustom: string
-  target: string
-  targetCustom: string
-  state: string
-  stateCustom: string
+  verb: string;  verbCustom: string
+  target: string; targetCustom: string
+  state: string;  stateCustom: string
 }
 
 interface Task {
@@ -27,20 +24,14 @@ interface Task {
   dueDate: string       // 'YYYY-MM-DD'
   priority: Priority
   completed: boolean
-  isToday: boolean      // marked as one of "today's 3"
+  isToday: boolean
+  assignee: string      // '自分' or person name
   completionCondition: CompletionCondition
-  createdAt: string     // ISO string
-  // Future fields:
-  // status: 'inProgress' | 'reviewing' | 'done'
-  // reviewDate: string
-  // retrospectiveMemo: string
-  // roughApprovalMode: boolean
+  createdAt: string
+  // Future: status, reviewDate, retrospectiveMemo, roughApprovalMode
 }
 
-interface WontDoItem {
-  id: string
-  text: string
-}
+interface WontDoItem { id: string; text: string }
 
 interface AppData {
   tasks: Task[]
@@ -51,59 +42,56 @@ interface AppData {
 // Constants
 // ============================================================
 
-const STORAGE_KEY = 'task-app-data'
-const MAX_TODAY = 3
-const MAX_WONT_DO = 3
-const DAY_PX = 28 // Gantt chart: pixels per day
+const STORAGE_KEY   = 'task-app-data'
+const MAX_TODAY     = 3
+const MAX_WONT_DO   = 3
+const DAY_PX        = 28
+const DEFAULT_ASSIGNEE = '自分'
 
 const VERB_OPTIONS = [
-  'ドラフトが', '要件が', '合意が', 'レビューが', '資料が', '議事録が',
-  '質問への回答が', '課題リストが', '設計案が', 'テストが',
+  'ドラフトが','要件が','合意が','レビューが','資料が','議事録が',
+  '質問への回答が','課題リストが','設計案が','テストが',
 ]
-const TARGET_OPTIONS = [
-  '自分で', 'NRIから', '上司と', '業務部門と', 'チーム内で', '関係者間で',
-]
-const STATE_OPTIONS = [
-  '完成している', '確定している', '共有済みになっている',
-  'フィードバック反映済みになっている', '承認されている', '着手可能になっている',
+const TARGET_OPTIONS = ['自分で','NRIから','上司と','業務部門と','チーム内で','関係者間で']
+const STATE_OPTIONS  = [
+  '完成している','確定している','共有済みになっている',
+  'フィードバック反映済みになっている','承認されている','着手可能になっている',
 ]
 
 const PRIORITY_CONFIG: Record<Priority, { label: string; badge: string; bar: string; barDone: string }> = {
-  high:   { label: '高', badge: 'bg-red-100 text-red-700',    bar: 'bg-red-300',    barDone: 'bg-red-200' },
+  high:   { label: '高', badge: 'bg-red-100 text-red-700',       bar: 'bg-red-300',    barDone: 'bg-red-200'    },
   medium: { label: '中', badge: 'bg-yellow-100 text-yellow-700', bar: 'bg-yellow-300', barDone: 'bg-yellow-200' },
-  low:    { label: '低', badge: 'bg-gray-100 text-gray-500',  bar: 'bg-gray-300',   barDone: 'bg-gray-200' },
+  low:    { label: '低', badge: 'bg-gray-100 text-gray-500',     bar: 'bg-gray-300',   barDone: 'bg-gray-200'   },
 }
 
 // ============================================================
 // Utilities
 // ============================================================
 
-const genId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
-const todayStr = () => new Date().toISOString().split('T')[0]
-const isToday = (d: string) => d === todayStr()
+const genId     = () => `${Date.now()}-${Math.random().toString(36).slice(2,9)}`
+const todayStr  = () => new Date().toISOString().split('T')[0]
+const isToday   = (d: string) => d === todayStr()
 
 const isThisWeek = (d: string): boolean => {
   if (!d) return false
   const date = new Date(d + 'T00:00:00')
-  const now = new Date(); now.setHours(0, 0, 0, 0)
+  const now = new Date(); now.setHours(0,0,0,0)
   const dow = now.getDay()
-  const mon = new Date(now); mon.setDate(now.getDate() - (dow === 0 ? 6 : dow - 1))
-  const sun = new Date(mon); sun.setDate(mon.getDate() + 6); sun.setHours(23, 59, 59, 999)
+  const mon = new Date(now); mon.setDate(now.getDate() - (dow===0?6:dow-1))
+  const sun = new Date(mon); sun.setDate(mon.getDate()+6); sun.setHours(23,59,59,999)
   return date >= mon && date <= sun
 }
 
-const isOverdue = (d: string): boolean => !!d && d < todayStr()
+const isOverdue  = (d: string): boolean => !!d && d < todayStr()
 
-const fmtDate = (d: string): string => {
-  if (!d) return ''
-  return new Date(d + 'T00:00:00').toLocaleDateString('ja-JP', { month: 'short', day: 'numeric' })
-}
+const fmtDate = (d: string) =>
+  d ? new Date(d+'T00:00:00').toLocaleDateString('ja-JP',{month:'short',day:'numeric'}) : ''
 
-const fmtCondition = (cc: CompletionCondition): string => {
-  const v = cc.verb   === 'other' ? cc.verbCustom   : cc.verb
-  const t = cc.target === 'other' ? cc.targetCustom : cc.target
-  const s = cc.state  === 'other' ? cc.stateCustom  : cc.state
-  return [v, t, s].filter(Boolean).join('')
+const fmtCondition = (cc: CompletionCondition) => {
+  const v = cc.verb==='other'   ? cc.verbCustom   : cc.verb
+  const t = cc.target==='other' ? cc.targetCustom : cc.target
+  const s = cc.state==='other'  ? cc.stateCustom  : cc.state
+  return [v,t,s].filter(Boolean).join('')
 }
 
 // ============================================================
@@ -113,7 +101,11 @@ const fmtCondition = (cc: CompletionCondition): string => {
 const loadData = (): AppData => {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    return raw ? (JSON.parse(raw) as AppData) : { tasks: [], wontDoItems: [] }
+    if (!raw) return { tasks: [], wontDoItems: [] }
+    const data = JSON.parse(raw) as AppData
+    // 後方互換: assignee未設定タスクに '自分' をセット
+    data.tasks = data.tasks.map(t => ({ ...t, assignee: t.assignee ?? DEFAULT_ASSIGNEE }))
+    return data
   } catch { return { tasks: [], wontDoItems: [] } }
 }
 
@@ -124,21 +116,22 @@ const saveData = (data: AppData) => localStorage.setItem(STORAGE_KEY, JSON.strin
 // ============================================================
 
 const handleExportCSV = (tasks: Task[]) => {
-  const headers = ['タイトル', '優先度', '期限', '完了', '今日の3つ', '完了条件', '作成日']
+  const headers = ['タイトル','宛先','優先度','期限','完了','今日の3つ','完了条件','作成日']
   const rows = tasks.map(t => [
-    `"${t.title.replace(/"/g, '""')}"`,
+    `"${t.title.replace(/"/g,'""')}"`,
+    t.assignee,
     PRIORITY_CONFIG[t.priority].label,
     t.dueDate,
     t.completed ? '完了' : '未完了',
     t.isToday ? 'はい' : 'いいえ',
-    `"${fmtCondition(t.completionCondition).replace(/"/g, '""')}"`,
+    `"${fmtCondition(t.completionCondition).replace(/"/g,'""')}"`,
     t.createdAt.split('T')[0],
   ])
-  const csv = [headers, ...rows].map(r => r.join(',')).join('\n')
-  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url; a.download = `tasks-${todayStr()}.csv`; a.click()
+  const csv = [headers,...rows].map(r=>r.join(',')).join('\n')
+  const blob = new Blob(['﻿'+csv],{type:'text/csv;charset=utf-8;'})
+  const url  = URL.createObjectURL(blob)
+  const a    = document.createElement('a')
+  a.href=url; a.download=`tasks-${todayStr()}.csv`; a.click()
   URL.revokeObjectURL(url)
 }
 
@@ -149,25 +142,24 @@ const handleExportCSV = (tasks: Task[]) => {
 interface ConditionSelectProps {
   label: string; options: string[]
   value: string; customValue: string
-  onChange: (v: string) => void; onCustomChange: (v: string) => void
+  onChange: (v: string)=>void; onCustomChange: (v: string)=>void
 }
-
 const ConditionSelect: React.FC<ConditionSelectProps> = ({
-  label, options, value, customValue, onChange, onCustomChange,
+  label,options,value,customValue,onChange,onCustomChange
 }) => (
   <div className="flex flex-col gap-1 flex-1 min-w-0">
     <label className="text-xs text-gray-500">{label}</label>
-    <select
-      value={value} onChange={e => onChange(e.target.value)}
+    <select value={value} onChange={e=>onChange(e.target.value)}
       className="text-sm border border-gray-200 rounded-md px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-navy bg-white"
     >
       <option value="">未設定</option>
-      {options.map(o => <option key={o} value={o}>{o}</option>)}
+      {options.map(o=><option key={o} value={o}>{o}</option>)}
       <option value="other">その他（自由入力）</option>
     </select>
-    {value === 'other' && (
-      <input type="text" value={customValue} onChange={e => onCustomChange(e.target.value)}
-        placeholder="自由入力..." className="text-sm border border-gray-200 rounded-md px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-navy"
+    {value==='other' && (
+      <input type="text" value={customValue} onChange={e=>onCustomChange(e.target.value)}
+        placeholder="自由入力..."
+        className="text-sm border border-gray-200 rounded-md px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-navy"
       />
     )}
   </div>
@@ -178,58 +170,113 @@ const ConditionSelect: React.FC<ConditionSelectProps> = ({
 // ============================================================
 
 const emptyCC = (): CompletionCondition => ({
-  verb: '', verbCustom: '', target: '', targetCustom: '', state: '', stateCustom: '',
+  verb:'',verbCustom:'',target:'',targetCustom:'',state:'',stateCustom:'',
 })
-
 const makeNewTask = (): Task => ({
   id: genId(), title: '', dueDate: '', priority: 'medium',
-  completed: false, isToday: false, completionCondition: emptyCC(),
-  createdAt: new Date().toISOString(),
+  completed: false, isToday: false, assignee: DEFAULT_ASSIGNEE,
+  completionCondition: emptyCC(), createdAt: new Date().toISOString(),
 })
 
 interface TaskModalProps {
   initial: Task | null
+  knownAssignees: string[]   // '自分' を含む既知の宛先リスト
   onSave: (t: Task) => void
   onClose: () => void
 }
 
-const TaskModal: React.FC<TaskModalProps> = ({ initial, onSave, onClose }) => {
+const TaskModal: React.FC<TaskModalProps> = ({ initial, knownAssignees, onSave, onClose }) => {
   const [form, setForm] = useState<Task>(initial ?? makeNewTask())
+  // 宛先: 既知リストにないときは「新規」モード
+  const isNew = !knownAssignees.includes(form.assignee) && form.assignee !== ''
+  const [newAssigneeDraft, setNewAssigneeDraft] = useState(isNew ? form.assignee : '')
+  const [assigneeMode, setAssigneeMode] = useState<'select'|'new'>(isNew ? 'new' : 'select')
+
   const cc = form.completionCondition
   const preview = fmtCondition(cc)
   const setCC = (field: keyof CompletionCondition, v: string) =>
-    setForm(f => ({ ...f, completionCondition: { ...f.completionCondition, [field]: v } }))
+    setForm(f=>({...f,completionCondition:{...f.completionCondition,[field]:v}}))
+
+  const handleAssigneeSelectChange = (v: string) => {
+    if (v === '__new__') {
+      setAssigneeMode('new')
+      setForm(f=>({...f, assignee: newAssigneeDraft}))
+    } else {
+      setAssigneeMode('select')
+      setForm(f=>({...f, assignee: v}))
+    }
+  }
+
+  const handleNewAssigneeInput = (v: string) => {
+    setNewAssigneeDraft(v)
+    setForm(f=>({...f, assignee: v}))
+  }
+
+  const effectiveAssignee = assigneeMode === 'new'
+    ? (newAssigneeDraft.trim() || DEFAULT_ASSIGNEE)
+    : form.assignee
+
+  const canSave = form.title.trim().length > 0
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-lg shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
-          <h2 className="font-semibold text-gray-800">{initial ? 'タスクを編集' : 'タスクを追加'}</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1"><X size={18} /></button>
+          <h2 className="font-semibold text-gray-800">{initial?'タスクを編集':'タスクを追加'}</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1"><X size={18}/></button>
         </div>
+
         <div className="px-6 py-5 space-y-5">
+          {/* タスク名 */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1.5">
               タスク名 <span className="text-red-400">*</span>
             </label>
             <input type="text" value={form.title}
-              onChange={e => setForm(f => ({ ...f, title: e.target.value }))}
+              onChange={e=>setForm(f=>({...f,title:e.target.value}))}
               placeholder="タスク名を入力..." autoFocus
               className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy"
             />
           </div>
+
+          {/* 宛先 */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">宛先</label>
+            <div className="flex gap-2">
+              <select
+                value={assigneeMode==='new' ? '__new__' : form.assignee}
+                onChange={e=>handleAssigneeSelectChange(e.target.value)}
+                className="flex-1 border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy bg-white"
+              >
+                {knownAssignees.map(a=>(
+                  <option key={a} value={a}>{a}</option>
+                ))}
+                <option value="__new__">＋ 新しく追加...</option>
+              </select>
+              {assigneeMode==='new' && (
+                <input type="text" value={newAssigneeDraft}
+                  onChange={e=>handleNewAssigneeInput(e.target.value)}
+                  placeholder="例: 田中さん"
+                  className="flex-1 border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy"
+                  autoFocus
+                />
+              )}
+            </div>
+          </div>
+
+          {/* 期限日・優先度 */}
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1.5">期限日</label>
               <input type="date" value={form.dueDate}
-                onChange={e => setForm(f => ({ ...f, dueDate: e.target.value }))}
+                onChange={e=>setForm(f=>({...f,dueDate:e.target.value}))}
                 className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy"
               />
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1.5">優先度</label>
               <select value={form.priority}
-                onChange={e => setForm(f => ({ ...f, priority: e.target.value as Priority }))}
+                onChange={e=>setForm(f=>({...f,priority:e.target.value as Priority}))}
                 className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy bg-white"
               >
                 <option value="high">高</option>
@@ -238,18 +285,20 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, onSave, onClose }) => {
               </select>
             </div>
           </div>
+
+          {/* 完了条件 */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-2">完了条件</label>
             <div className="flex gap-2">
               <ConditionSelect label="動詞" options={VERB_OPTIONS}
                 value={cc.verb} customValue={cc.verbCustom}
-                onChange={v => setCC('verb', v)} onCustomChange={v => setCC('verbCustom', v)} />
+                onChange={v=>setCC('verb',v)} onCustomChange={v=>setCC('verbCustom',v)}/>
               <ConditionSelect label="対象" options={TARGET_OPTIONS}
                 value={cc.target} customValue={cc.targetCustom}
-                onChange={v => setCC('target', v)} onCustomChange={v => setCC('targetCustom', v)} />
+                onChange={v=>setCC('target',v)} onCustomChange={v=>setCC('targetCustom',v)}/>
               <ConditionSelect label="状態" options={STATE_OPTIONS}
                 value={cc.state} customValue={cc.stateCustom}
-                onChange={v => setCC('state', v)} onCustomChange={v => setCC('stateCustom', v)} />
+                onChange={v=>setCC('state',v)} onCustomChange={v=>setCC('stateCustom',v)}/>
             </div>
             {preview && (
               <p className="mt-2.5 text-xs bg-gray-50 text-gray-600 rounded px-3 py-2">
@@ -258,14 +307,17 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, onSave, onClose }) => {
             )}
           </div>
         </div>
+
         <div className="flex justify-end gap-2 px-6 py-4 border-t border-gray-100">
           <button onClick={onClose} className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700">
             キャンセル
           </button>
-          <button onClick={() => form.title.trim() && onSave(form)} disabled={!form.title.trim()}
+          <button
+            onClick={() => canSave && onSave({...form, assignee: effectiveAssignee})}
+            disabled={!canSave}
             className="px-4 py-2 text-sm bg-navy text-white rounded-md hover:bg-navy-dark disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            {initial ? '保存' : '追加'}
+            {initial?'保存':'追加'}
           </button>
         </div>
       </div>
@@ -279,50 +331,134 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, onSave, onClose }) => {
 
 interface TaskCardProps {
   task: Task
-  onComplete: (id: string) => void
-  onToday: (id: string) => void
-  onEdit: (t: Task) => void
-  onDelete: (id: string) => void
+  onComplete: (id: string)=>void
+  onToday:    (id: string)=>void
+  onEdit:     (t: Task)=>void
+  onDelete:   (id: string)=>void
+  hideAssignee?: boolean   // 宛先別ビューでは列ヘッダーで分かるので非表示に
 }
 
-const TaskCard: React.FC<TaskCardProps> = ({ task, onComplete, onToday, onEdit, onDelete }) => {
+const TaskCard: React.FC<TaskCardProps> = ({
+  task,onComplete,onToday,onEdit,onDelete,hideAssignee=false
+}) => {
   const pc = PRIORITY_CONFIG[task.priority]
   const condition = fmtCondition(task.completionCondition)
-  const overdue = !task.completed && isOverdue(task.dueDate)
+  const overdue   = !task.completed && isOverdue(task.dueDate)
 
   return (
-    <div className={`bg-white border border-gray-200 rounded-md px-4 py-3 flex gap-3 items-start ${task.completed ? 'opacity-50' : ''}`}>
-      <button onClick={() => onComplete(task.id)}
+    <div className={`bg-white border border-gray-200 rounded-md px-4 py-3 flex gap-3 items-start ${task.completed?'opacity-50':''}`}>
+      {/* チェックボックス */}
+      <button onClick={()=>onComplete(task.id)}
         className={`mt-0.5 w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 transition-colors ${
-          task.completed ? 'bg-navy border-navy' : 'border-gray-300 hover:border-navy'
+          task.completed?'bg-navy border-navy':'border-gray-300 hover:border-navy'
         }`}
       >
-        {task.completed && <Check size={11} className="text-white" />}
+        {task.completed && <Check size={11} className="text-white"/>}
       </button>
+
+      {/* 本文 */}
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className={`text-sm font-medium ${task.completed ? 'line-through text-gray-400' : 'text-gray-800'}`}>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className={`text-sm font-medium ${task.completed?'line-through text-gray-400':'text-gray-800'}`}>
             {task.title}
           </span>
           <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${pc.badge}`}>{pc.label}</span>
+          {/* 宛先バッジ（自分以外・宛先別ビュー以外） */}
+          {!hideAssignee && task.assignee !== DEFAULT_ASSIGNEE && (
+            <span className="text-xs px-1.5 py-0.5 rounded bg-navy/10 text-navy flex-shrink-0">
+              → {task.assignee}
+            </span>
+          )}
         </div>
         {condition && <p className="text-xs text-gray-400 mt-0.5 truncate">完了条件: {condition}</p>}
         {task.dueDate && (
-          <div className={`flex items-center gap-1 mt-1 text-xs ${overdue ? 'text-red-500' : 'text-gray-400'}`}>
-            <Calendar size={11} />
-            <span>{fmtDate(task.dueDate)}{overdue ? '（期限切れ）' : ''}</span>
+          <div className={`flex items-center gap-1 mt-1 text-xs ${overdue?'text-red-500':'text-gray-400'}`}>
+            <Calendar size={11}/>
+            <span>{fmtDate(task.dueDate)}{overdue?'（期限切れ）':''}</span>
           </div>
         )}
       </div>
+
+      {/* アクション */}
       <div className="flex items-center gap-1 flex-shrink-0">
-        <button onClick={() => onToday(task.id)}
-          title={task.isToday ? '今日の3つから外す' : '今日の3つに追加'}
+        <button onClick={()=>onToday(task.id)}
+          title={task.isToday?'今日の3つから外す':'今日の3つに追加'}
           className={`text-xs px-2 py-1 rounded transition-colors ${
-            task.isToday ? 'bg-navy text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+            task.isToday?'bg-navy text-white':'bg-gray-100 text-gray-500 hover:bg-gray-200'
           }`}
         >今日</button>
-        <button onClick={() => onEdit(task)} className="p-1 text-gray-400 hover:text-gray-700"><Pencil size={14} /></button>
-        <button onClick={() => onDelete(task.id)} className="p-1 text-gray-400 hover:text-red-500"><Trash2 size={14} /></button>
+        <button onClick={()=>onEdit(task)} className="p-1 text-gray-400 hover:text-gray-700"><Pencil size={14}/></button>
+        <button onClick={()=>onDelete(task.id)} className="p-1 text-gray-400 hover:text-red-500"><Trash2 size={14}/></button>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
+// AssigneeView — 宛先別横並び列
+// ============================================================
+
+interface AssigneeViewProps {
+  tasks: Task[]
+  knownAssignees: string[]
+  onComplete: (id: string)=>void
+  onToday:    (id: string)=>void
+  onEdit:     (t: Task)=>void
+  onDelete:   (id: string)=>void
+}
+
+const AssigneeView: React.FC<AssigneeViewProps> = ({
+  tasks,knownAssignees,onComplete,onToday,onEdit,onDelete
+}) => {
+  // 宛先ごとにタスクをグループ化（タスクが1件以上ある宛先のみ列を表示）
+  const cols = knownAssignees.map(assignee => ({
+    assignee,
+    tasks: tasks.filter(t => t.assignee === assignee),
+  })).filter(c => c.tasks.length > 0)
+
+  if (cols.length === 0) {
+    return (
+      <div className="text-center py-12 text-gray-400 text-sm">タスクがありません</div>
+    )
+  }
+
+  return (
+    <div className="overflow-x-auto pb-4">
+      <div className="flex gap-4" style={{ minWidth: 'max-content' }}>
+        {cols.map(({ assignee, tasks: colTasks }) => {
+          const activeCount = colTasks.filter(t=>!t.completed).length
+          const isSelf = assignee === DEFAULT_ASSIGNEE
+
+          return (
+            <div key={assignee} className="w-72 flex-shrink-0">
+              {/* 列ヘッダー */}
+              <div className={`flex items-center justify-between px-3 py-2 rounded-lg mb-3 ${
+                isSelf ? 'bg-navy/10' : 'bg-amber-50 border border-amber-200'
+              }`}>
+                <div className="flex items-center gap-2">
+                  <Users size={14} className={isSelf?'text-navy':'text-amber-600'}/>
+                  <span className={`text-sm font-semibold ${isSelf?'text-navy':'text-amber-700'}`}>
+                    {assignee}
+                  </span>
+                </div>
+                <span className="text-xs text-gray-500 bg-white px-1.5 py-0.5 rounded-full">
+                  {activeCount}件
+                </span>
+              </div>
+
+              {/* タスク一覧 */}
+              <div className="space-y-2">
+                {colTasks.map(task => (
+                  <TaskCard key={task.id} task={task}
+                    onComplete={onComplete} onToday={onToday}
+                    onEdit={onEdit} onDelete={onDelete}
+                    hideAssignee={true}
+                  />
+                ))}
+              </div>
+            </div>
+          )
+        })}
       </div>
     </div>
   )
@@ -334,140 +470,89 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onComplete, onToday, onEdit, 
 
 const GanttChart: React.FC<{ tasks: Task[] }> = ({ tasks }) => {
   const scrollRef = useRef<HTMLDivElement>(null)
-  const withDates = tasks.filter(t => t.dueDate)
+  const withDates = tasks.filter(t=>t.dueDate)
 
-  const today = new Date(); today.setHours(0, 0, 0, 0)
-
-  // Compute date range from all task dates, padded around today
-  const allMs = withDates.flatMap(t => [
-    new Date(t.createdAt.split('T')[0] + 'T00:00:00').getTime(),
-    new Date(t.dueDate + 'T00:00:00').getTime(),
+  const today = new Date(); today.setHours(0,0,0,0)
+  const allMs = withDates.flatMap(t=>[
+    new Date(t.createdAt.split('T')[0]+'T00:00:00').getTime(),
+    new Date(t.dueDate+'T00:00:00').getTime(),
   ])
   const rawMin = allMs.length ? Math.min(...allMs) : today.getTime()
   const rawMax = allMs.length ? Math.max(...allMs) : today.getTime()
-
-  const winStart = new Date(Math.min(rawMin, today.getTime() - 14 * 86400000))
-  const winEnd   = new Date(Math.max(rawMax, today.getTime() + 28 * 86400000))
-
-  // Snap winStart to Monday
+  const winStart = new Date(Math.min(rawMin, today.getTime()-14*86400000))
+  const winEnd   = new Date(Math.max(rawMax, today.getTime()+28*86400000))
   const dow = winStart.getDay()
-  winStart.setDate(winStart.getDate() - (dow === 0 ? 6 : dow - 1))
-
-  const totalDays = Math.ceil((winEnd.getTime() - winStart.getTime()) / 86400000) + 7
-  const chartWidth = totalDays * DAY_PX
-
-  const dayOffset = (d: Date) =>
-    Math.floor((d.getTime() - winStart.getTime()) / 86400000)
-
-  const todayX = dayOffset(today) * DAY_PX
-
-  // Weekly ruler marks (every Monday)
+  winStart.setDate(winStart.getDate()-(dow===0?6:dow-1))
+  const totalDays = Math.ceil((winEnd.getTime()-winStart.getTime())/86400000)+7
+  const chartWidth = totalDays*DAY_PX
+  const dayOffset  = (d: Date) => Math.floor((d.getTime()-winStart.getTime())/86400000)
+  const todayX     = dayOffset(today)*DAY_PX
   const weeks: Date[] = []
   const cur = new Date(winStart)
-  while (cur.getTime() <= winEnd.getTime() + 7 * 86400000) {
-    weeks.push(new Date(cur)); cur.setDate(cur.getDate() + 7)
+  while (cur.getTime()<=winEnd.getTime()+7*86400000) {
+    weeks.push(new Date(cur)); cur.setDate(cur.getDate()+7)
   }
+  useEffect(()=>{
+    if (scrollRef.current) scrollRef.current.scrollLeft = Math.max(0,todayX-120)
+  },[todayX])
 
-  // Scroll to show today near left after render
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollLeft = Math.max(0, todayX - 120)
-    }
-  }, [todayX])
-
-  if (withDates.length === 0) {
-    return (
-      <div className="bg-white border border-gray-200 rounded-lg py-12 text-center text-gray-400 text-sm">
-        期限日が設定されたタスクがありません
-      </div>
-    )
-  }
-
+  if (withDates.length===0) return (
+    <div className="bg-white border border-gray-200 rounded-lg py-12 text-center text-gray-400 text-sm">
+      期限日が設定されたタスクがありません
+    </div>
+  )
   const ROW_H = 44
-
   return (
     <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
       <div className="flex">
-        {/* Fixed left: task name column */}
         <div className="w-44 flex-shrink-0 border-r border-gray-100 bg-white">
-          <div className="h-9 bg-gray-50 border-b border-gray-200" />
-          {withDates.map(task => (
+          <div className="h-9 bg-gray-50 border-b border-gray-200"/>
+          {withDates.map(task=>(
             <div key={task.id}
-              className={`flex items-center gap-1.5 px-3 border-b border-gray-100 ${task.completed ? 'opacity-40' : ''}`}
-              style={{ height: ROW_H }}
+              className={`flex items-center gap-1.5 px-3 border-b border-gray-100 ${task.completed?'opacity-40':''}`}
+              style={{height:ROW_H}}
             >
-              {task.isToday && (
-                <span className="w-1.5 h-1.5 rounded-full bg-navy flex-shrink-0" title="今日の3つ" />
-              )}
+              {task.isToday && <span className="w-1.5 h-1.5 rounded-full bg-navy flex-shrink-0"/>}
               <span className="text-xs text-gray-700 truncate">{task.title}</span>
             </div>
           ))}
         </div>
-
-        {/* Scrollable chart */}
         <div ref={scrollRef} className="flex-1 overflow-x-auto">
-          <div style={{ width: chartWidth }}>
-
-            {/* Date ruler */}
+          <div style={{width:chartWidth}}>
             <div className="relative h-9 bg-gray-50 border-b border-gray-200">
-              {weeks.map((w, i) => (
-                <div key={i}
-                  className="absolute top-0 bottom-0 flex items-center border-l border-gray-200"
-                  style={{ left: dayOffset(w) * DAY_PX }}
-                >
+              {weeks.map((w,i)=>(
+                <div key={i} className="absolute top-0 bottom-0 flex items-center border-l border-gray-200"
+                  style={{left:dayOffset(w)*DAY_PX}}>
                   <span className="text-xs text-gray-400 pl-1.5 whitespace-nowrap">
-                    {w.toLocaleDateString('ja-JP', { month: 'numeric', day: 'numeric' })}
+                    {w.toLocaleDateString('ja-JP',{month:'numeric',day:'numeric'})}
                   </span>
                 </div>
               ))}
             </div>
-
-            {/* Task rows */}
             <div className="relative">
-              {/* Week grid lines */}
-              {weeks.map((w, i) => (
+              {weeks.map((w,i)=>(
                 <div key={i} className="absolute top-0 bottom-0 border-l border-gray-100"
-                  style={{ left: dayOffset(w) * DAY_PX }} />
+                  style={{left:dayOffset(w)*DAY_PX}}/>
               ))}
-
-              {/* Today marker */}
               <div className="absolute top-0 bottom-0 w-0.5 bg-red-400 z-10 opacity-75"
-                style={{ left: todayX }} />
-
-              {/* Task bars */}
-              {withDates.map(task => {
-                const start = new Date(task.createdAt.split('T')[0] + 'T00:00:00')
-                const end   = new Date(task.dueDate + 'T00:00:00')
-                const x     = Math.max(0, dayOffset(start)) * DAY_PX
-                const endX  = Math.max(x + DAY_PX, dayOffset(end) * DAY_PX)
-                const barW  = endX - x
-                const pc    = PRIORITY_CONFIG[task.priority]
-                const overdue = !task.completed && isOverdue(task.dueDate)
-
+                style={{left:todayX}}/>
+              {withDates.map(task=>{
+                const start  = new Date(task.createdAt.split('T')[0]+'T00:00:00')
+                const end    = new Date(task.dueDate+'T00:00:00')
+                const x      = Math.max(0,dayOffset(start))*DAY_PX
+                const endX   = Math.max(x+DAY_PX,dayOffset(end)*DAY_PX)
+                const barW   = endX-x
+                const pc     = PRIORITY_CONFIG[task.priority]
+                const overdue= !task.completed && isOverdue(task.dueDate)
                 return (
-                  <div key={task.id}
-                    className="relative border-b border-gray-100 flex items-center"
-                    style={{ height: ROW_H }}
-                  >
-                    {/* Main bar */}
-                    <div
-                      className={`absolute h-6 rounded flex items-center ${task.completed ? pc.barDone + ' opacity-50' : pc.bar}`}
-                      style={{ left: x, width: barW }}
-                      title={`${task.title}　期限: ${fmtDate(task.dueDate)}`}
-                    >
-                      {task.completed && <Check size={11} className="ml-1.5 text-gray-600 flex-shrink-0" />}
+                  <div key={task.id} className="relative border-b border-gray-100 flex items-center" style={{height:ROW_H}}>
+                    <div className={`absolute h-6 rounded flex items-center ${task.completed?pc.barDone+' opacity-50':pc.bar}`}
+                      style={{left:x,width:barW}} title={`${task.title}　期限: ${fmtDate(task.dueDate)}`}>
+                      {task.completed && <Check size={11} className="ml-1.5 text-gray-600 flex-shrink-0"/>}
                     </div>
-                    {/* Overdue right-edge marker */}
-                    {overdue && (
-                      <div className="absolute w-1.5 h-6 bg-red-600 rounded-r opacity-70 z-10"
-                        style={{ left: endX - 6 }} />
-                    )}
-                    {/* Due date label */}
-                    <span className={`absolute text-xs whitespace-nowrap ${overdue ? 'text-red-500' : 'text-gray-400'}`}
-                      style={{ left: endX + 4 }}
-                    >
-                      {fmtDate(task.dueDate)}
-                    </span>
+                    {overdue && <div className="absolute w-1.5 h-6 bg-red-600 rounded-r opacity-70 z-10" style={{left:endX-6}}/>}
+                    <span className={`absolute text-xs whitespace-nowrap ${overdue?'text-red-500':'text-gray-400'}`}
+                      style={{left:endX+4}}>{fmtDate(task.dueDate)}</span>
                   </div>
                 )
               })}
@@ -475,39 +560,28 @@ const GanttChart: React.FC<{ tasks: Task[] }> = ({ tasks }) => {
           </div>
         </div>
       </div>
-
-      {/* Legend */}
       <div className="flex items-center gap-4 px-4 py-2.5 border-t border-gray-100 bg-gray-50 text-xs text-gray-400">
-        <div className="flex items-center gap-1.5">
-          <div className="w-0.5 h-4 bg-red-400 opacity-75" />
-          <span>今日</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-1.5 h-1.5 rounded-full bg-navy" />
-          <span>今日の3つに選択中</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-1.5 h-4 bg-red-600 rounded opacity-70" />
-          <span>期限切れ</span>
-        </div>
+        <div className="flex items-center gap-1.5"><div className="w-0.5 h-4 bg-red-400 opacity-75"/><span>今日</span></div>
+        <div className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-navy"/><span>今日の3つに選択中</span></div>
+        <div className="flex items-center gap-1.5"><div className="w-1.5 h-4 bg-red-600 rounded opacity-70"/><span>期限切れ</span></div>
       </div>
     </div>
   )
 }
 
 // ============================================================
-// TeachingsModal — ノイマンの教え
+// TeachingsModal
 // ============================================================
 
-const TeachingsModal: React.FC<{ onClose: () => void }> = ({ onClose }) => (
+const TeachingsModal: React.FC<{onClose:()=>void}> = ({onClose}) => (
   <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
     <div className="bg-white rounded-lg shadow-xl w-full max-w-md max-h-[80vh] overflow-y-auto">
       <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
         <div className="flex items-center gap-2">
-          <BookOpen size={18} className="text-navy" />
+          <BookOpen size={18} className="text-navy"/>
           <h2 className="font-semibold text-gray-800">ノイマンの教え</h2>
         </div>
-        <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1"><X size={18} /></button>
+        <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1"><X size={18}/></button>
       </div>
       <div className="px-6 py-5 space-y-6">
         <div className="space-y-2">
@@ -517,11 +591,10 @@ const TeachingsModal: React.FC<{ onClose: () => void }> = ({ onClose }) => (
           </div>
           <p className="text-sm text-gray-600 leading-relaxed">
             1日に「今日やる」として選ぶタスクは<strong>最大3つ</strong>。
-            4つ目は入れない。優先順位を強制的に明確にし、
-            完了の達成感を毎日積み重ねるための原則。
+            4つ目は入れない。優先順位を強制的に明確にし、完了の達成感を毎日積み重ねるための原則。
           </p>
         </div>
-        <hr className="border-gray-100" />
+        <hr className="border-gray-100"/>
         <div className="space-y-2">
           <div className="flex items-center gap-2">
             <span className="text-xs font-bold text-navy bg-navy/10 px-2 py-0.5 rounded-full">教え 3</span>
@@ -544,19 +617,16 @@ const TeachingsModal: React.FC<{ onClose: () => void }> = ({ onClose }) => (
 )
 
 // ============================================================
-// Confirm/Alert Dialog (shared)
+// Dialog
 // ============================================================
 
 interface DialogProps {
   icon: React.ReactNode; iconColor: string
   title: string; body: string
   confirmLabel: string; confirmClass: string
-  onConfirm: () => void; onCancel: () => void
+  onConfirm: ()=>void; onCancel: ()=>void
 }
-
-const Dialog: React.FC<DialogProps> = ({
-  icon, iconColor, title, body, confirmLabel, confirmClass, onConfirm, onCancel,
-}) => (
+const Dialog: React.FC<DialogProps> = ({icon,iconColor,title,body,confirmLabel,confirmClass,onConfirm,onCancel}) => (
   <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
     <div className="bg-white rounded-lg shadow-xl p-6 w-full max-w-sm">
       <div className="flex items-start gap-3 mb-5">
@@ -567,12 +637,8 @@ const Dialog: React.FC<DialogProps> = ({
         </div>
       </div>
       <div className="flex justify-end gap-2">
-        <button onClick={onCancel} className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700">
-          キャンセル
-        </button>
-        <button onClick={onConfirm} className={`px-4 py-2 text-sm rounded-md ${confirmClass}`}>
-          {confirmLabel}
-        </button>
+        <button onClick={onCancel} className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700">キャンセル</button>
+        <button onClick={onConfirm} className={`px-4 py-2 text-sm rounded-md ${confirmClass}`}>{confirmLabel}</button>
       </div>
     </div>
   </div>
@@ -583,30 +649,35 @@ const Dialog: React.FC<DialogProps> = ({
 // ============================================================
 
 export default function App() {
-  const [tasks, setTasks]             = useState<Task[]>([])
-  const [wontDo, setWontDo]           = useState<WontDoItem[]>([])
-  const [filter, setFilter]           = useState<Filter>('all')
-  const [viewMode, setViewMode]       = useState<ViewMode>('list')
-  const [showModal, setShowModal]     = useState(false)
-  const [editTask, setEditTask]       = useState<Task | null>(null)
-  const [deleteId, setDeleteId]       = useState<string | null>(null)
-  const [todayWarn, setTodayWarn]     = useState(false)
-  const [showTeachings, setShowTeachings] = useState(false)
-  const [wontDoInput, setWontDoInput] = useState('')
+  const [tasks,    setTasks]    = useState<Task[]>([])
+  const [wontDo,   setWontDo]   = useState<WontDoItem[]>([])
+  const [filter,   setFilter]   = useState<Filter>('all')
+  const [viewMode, setViewMode] = useState<ViewMode>('list')
+  const [showModal,    setShowModal]    = useState(false)
+  const [editTask,     setEditTask]     = useState<Task|null>(null)
+  const [deleteId,     setDeleteId]     = useState<string|null>(null)
+  const [todayWarn,    setTodayWarn]    = useState(false)
+  const [showTeachings,setShowTeachings]= useState(false)
+  const [wontDoInput,  setWontDoInput]  = useState('')
 
-  useEffect(() => {
-    const data = loadData(); setTasks(data.tasks); setWontDo(data.wontDoItems)
-  }, [])
+  useEffect(()=>{ const d=loadData(); setTasks(d.tasks); setWontDo(d.wontDoItems) },[])
+  useEffect(()=>{ saveData({tasks,wontDoItems:wontDo}) },[tasks,wontDo])
 
-  useEffect(() => { saveData({ tasks, wontDoItems: wontDo }) }, [tasks, wontDo])
+  // 既知の宛先リスト（タスクに含まれる名前から自動生成）
+  const knownAssignees: string[] = [
+    DEFAULT_ASSIGNEE,
+    ...Array.from(new Set(
+      tasks.map(t=>t.assignee).filter((a): a is string => !!a && a !== DEFAULT_ASSIGNEE)
+    )).sort(),
+  ]
 
-  // Derived
-  const todayTasks       = tasks.filter(t => t.isToday)
-  const todayActiveCount = todayTasks.filter(t => !t.completed).length
+  // 派生データ
+  const todayTasks       = tasks.filter(t=>t.isToday)
+  const todayActiveCount = todayTasks.filter(t=>!t.completed).length
 
-  const allSectionTasks = tasks.filter(t => {
+  const allSectionTasks = tasks.filter(t=>{
     if (t.isToday) return false
-    switch (filter) {
+    switch(filter){
       case 'today':    return !!t.dueDate && isToday(t.dueDate)
       case 'thisWeek': return !!t.dueDate && isThisWeek(t.dueDate)
       case 'overdue':  return !t.completed && !!t.dueDate && isOverdue(t.dueDate)
@@ -614,40 +685,47 @@ export default function App() {
     }
   })
 
-  // Handlers
+  // ハンドラ
   const handleSave = (task: Task) => {
-    setTasks(prev => {
-      const idx = prev.findIndex(t => t.id === task.id)
-      return idx >= 0 ? prev.map(t => t.id === task.id ? task : t) : [...prev, task]
+    setTasks(prev=>{
+      const idx = prev.findIndex(t=>t.id===task.id)
+      return idx>=0 ? prev.map(t=>t.id===task.id?task:t) : [...prev,task]
     })
     setShowModal(false); setEditTask(null)
   }
 
   const handleComplete = (id: string) =>
-    setTasks(prev => prev.map(t => t.id === id ? { ...t, completed: !t.completed } : t))
+    setTasks(prev=>prev.map(t=>t.id===id?{...t,completed:!t.completed}:t))
 
   const handleToday = (id: string) => {
-    const task = tasks.find(t => t.id === id)
+    const task = tasks.find(t=>t.id===id)
     if (!task) return
-    if (!task.isToday && todayActiveCount >= MAX_TODAY) { setTodayWarn(true); return }
-    setTasks(prev => prev.map(t => t.id === id ? { ...t, isToday: !t.isToday } : t))
+    if (!task.isToday && todayActiveCount>=MAX_TODAY){ setTodayWarn(true); return }
+    setTasks(prev=>prev.map(t=>t.id===id?{...t,isToday:!t.isToday}:t))
   }
 
-  const handleEdit = (task: Task) => { setEditTask(task); setShowModal(true) }
+  const handleEdit   = (task: Task) => { setEditTask(task); setShowModal(true) }
 
   const handleDeleteConfirm = () => {
-    if (deleteId) { setTasks(prev => prev.filter(t => t.id !== deleteId)); setDeleteId(null) }
+    if (deleteId){ setTasks(prev=>prev.filter(t=>t.id!==deleteId)); setDeleteId(null) }
   }
 
   const handleAddWontDo = () => {
-    if (!wontDoInput.trim() || wontDo.length >= MAX_WONT_DO) return
-    setWontDo(prev => [...prev, { id: genId(), text: wontDoInput.trim() }])
+    if (!wontDoInput.trim()||wontDo.length>=MAX_WONT_DO) return
+    setWontDo(prev=>[...prev,{id:genId(),text:wontDoInput.trim()}])
     setWontDoInput('')
   }
 
-  const dateLabel = new Date().toLocaleDateString('ja-JP', {
-    year: 'numeric', month: 'long', day: 'numeric', weekday: 'short',
+  const dateLabel = new Date().toLocaleDateString('ja-JP',{
+    year:'numeric',month:'long',day:'numeric',weekday:'short',
   })
+
+  const commonCardProps = {
+    onComplete: handleComplete,
+    onToday:    handleToday,
+    onEdit:     handleEdit,
+    onDelete:   (id: string) => setDeleteId(id),
+  }
 
   return (
     <div className="min-h-screen bg-gray-50 font-sans">
@@ -661,51 +739,46 @@ export default function App() {
           </div>
           <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
             {/* ノイマンの教え */}
-            <button
-              onClick={() => setShowTeachings(true)}
+            <button onClick={()=>setShowTeachings(true)}
               className="flex items-center gap-1.5 text-sm bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-md transition-colors"
               title="ノイマンの教えを見る"
             >
-              <BookOpen size={14} />
+              <BookOpen size={14}/>
               <span className="hidden sm:inline">ノイマンの教え</span>
             </button>
-            {/* View toggle */}
+
+            {/* ビュー切替 */}
             <div className="flex rounded-md overflow-hidden border border-white/20">
-              <button
-                onClick={() => setViewMode('list')}
-                className={`flex items-center gap-1 px-2.5 py-1.5 text-sm transition-colors ${
-                  viewMode === 'list' ? 'bg-white/25' : 'hover:bg-white/10'
-                }`}
-                title="リスト表示"
-              >
-                <List size={14} />
-                <span className="hidden sm:inline text-xs">リスト</span>
-              </button>
-              <button
-                onClick={() => setViewMode('gantt')}
-                className={`flex items-center gap-1 px-2.5 py-1.5 text-sm transition-colors border-l border-white/20 ${
-                  viewMode === 'gantt' ? 'bg-white/25' : 'hover:bg-white/10'
-                }`}
-                title="ガントチャート表示"
-              >
-                <BarChart2 size={14} />
-                <span className="hidden sm:inline text-xs">ガント</span>
-              </button>
+              {([
+                {mode:'list'     as ViewMode, icon:<List size={14}/>,     label:'リスト'},
+                {mode:'gantt'    as ViewMode, icon:<BarChart2 size={14}/>, label:'ガント'},
+                {mode:'assignee' as ViewMode, icon:<Users size={14}/>,    label:'宛先別'},
+              ]).map(({mode,icon,label},i)=>(
+                <button key={mode} onClick={()=>setViewMode(mode)}
+                  className={`flex items-center gap-1 px-2.5 py-1.5 text-sm transition-colors ${
+                    i>0?'border-l border-white/20':''
+                  } ${viewMode===mode?'bg-white/25':'hover:bg-white/10'}`}
+                  title={label}
+                >
+                  {icon}
+                  <span className="hidden sm:inline text-xs">{label}</span>
+                </button>
+              ))}
             </div>
+
             {/* CSV */}
-            <button
-              onClick={() => handleExportCSV(tasks)}
+            <button onClick={()=>handleExportCSV(tasks)}
               className="flex items-center gap-1.5 text-sm bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-md transition-colors"
             >
-              <Download size={14} />
+              <Download size={14}/>
               <span className="hidden sm:inline">CSV</span>
             </button>
-            {/* Add task */}
-            <button
-              onClick={() => { setEditTask(null); setShowModal(true) }}
+
+            {/* タスクを追加 */}
+            <button onClick={()=>{setEditTask(null);setShowModal(true)}}
               className="flex items-center gap-1.5 text-sm bg-white text-navy font-medium px-3 py-1.5 rounded-md hover:bg-blue-50 transition-colors"
             >
-              <Plus size={14} />
+              <Plus size={14}/>
               <span className="hidden sm:inline">タスクを追加</span>
               <span className="sm:hidden">追加</span>
             </button>
@@ -715,21 +788,34 @@ export default function App() {
 
       <main className="max-w-4xl mx-auto px-4 py-6 space-y-6">
 
-        {/* ===== Gantt View ===== */}
-        {viewMode === 'gantt' && (
+        {/* ===== ガントビュー ===== */}
+        {viewMode==='gantt' && (
           <section>
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h2 className="font-semibold text-gray-800">ガントチャート</h2>
-                <p className="text-xs text-gray-500 mt-0.5">全タスクの期限・進捗を時系列で確認</p>
-              </div>
+            <div className="mb-4">
+              <h2 className="font-semibold text-gray-800">ガントチャート</h2>
+              <p className="text-xs text-gray-500 mt-0.5">全タスクの期限・進捗を時系列で確認</p>
             </div>
-            <GanttChart tasks={tasks} />
+            <GanttChart tasks={tasks}/>
           </section>
         )}
 
-        {/* ===== List View ===== */}
-        {viewMode === 'list' && (
+        {/* ===== 宛先別ビュー ===== */}
+        {viewMode==='assignee' && (
+          <section>
+            <div className="mb-4">
+              <h2 className="font-semibold text-gray-800">宛先別</h2>
+              <p className="text-xs text-gray-500 mt-0.5">誰あてのタスクかで整理</p>
+            </div>
+            <AssigneeView
+              tasks={tasks}
+              knownAssignees={knownAssignees}
+              {...commonCardProps}
+            />
+          </section>
+        )}
+
+        {/* ===== リストビュー ===== */}
+        {viewMode==='list' && (
           <>
             {/* 今日の3つ */}
             <section className="bg-gray-100 rounded-lg p-5">
@@ -739,21 +825,17 @@ export default function App() {
                   <p className="text-xs text-gray-500 mt-0.5">今日やる最重要タスク（最大3つ）</p>
                 </div>
                 <span className={`text-sm font-medium px-2.5 py-1 rounded-full flex-shrink-0 ${
-                  todayActiveCount >= MAX_TODAY ? 'bg-red-100 text-red-600' : 'bg-navy/10 text-navy'
-                }`}>
-                  {todayActiveCount} / {MAX_TODAY}
-                </span>
+                  todayActiveCount>=MAX_TODAY?'bg-red-100 text-red-600':'bg-navy/10 text-navy'
+                }`}>{todayActiveCount} / {MAX_TODAY}</span>
               </div>
-              {todayTasks.length === 0 ? (
+              {todayTasks.length===0 ? (
                 <div className="text-center py-6 text-gray-400 text-sm">
                   タスクカードの「今日」ボタンで追加できます
                 </div>
               ) : (
                 <div className="space-y-2">
-                  {todayTasks.map(task => (
-                    <TaskCard key={task.id} task={task}
-                      onComplete={handleComplete} onToday={handleToday}
-                      onEdit={handleEdit} onDelete={id => setDeleteId(id)} />
+                  {todayTasks.map(task=>(
+                    <TaskCard key={task.id} task={task} {...commonCardProps}/>
                   ))}
                 </div>
               )}
@@ -765,27 +847,25 @@ export default function App() {
                 <h2 className="font-semibold text-gray-800">全タスク</h2>
                 <div className="flex gap-1 flex-wrap">
                   {([
-                    { key: 'all'      as Filter, label: 'すべて' },
-                    { key: 'today'    as Filter, label: '今日' },
-                    { key: 'thisWeek' as Filter, label: '今週' },
-                    { key: 'overdue'  as Filter, label: '期限切れ' },
-                  ]).map(f => (
-                    <button key={f.key} onClick={() => setFilter(f.key)}
+                    {key:'all'      as Filter,label:'すべて'},
+                    {key:'today'    as Filter,label:'今日'},
+                    {key:'thisWeek' as Filter,label:'今週'},
+                    {key:'overdue'  as Filter,label:'期限切れ'},
+                  ]).map(f=>(
+                    <button key={f.key} onClick={()=>setFilter(f.key)}
                       className={`text-xs px-3 py-1.5 rounded-md transition-colors ${
-                        filter === f.key ? 'bg-navy text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                        filter===f.key?'bg-navy text-white':'bg-gray-100 text-gray-600 hover:bg-gray-200'
                       }`}
                     >{f.label}</button>
                   ))}
                 </div>
               </div>
-              {allSectionTasks.length === 0 ? (
+              {allSectionTasks.length===0 ? (
                 <div className="text-center py-12 text-gray-400 text-sm">タスクがありません</div>
               ) : (
                 <div className="space-y-2">
-                  {allSectionTasks.map(task => (
-                    <TaskCard key={task.id} task={task}
-                      onComplete={handleComplete} onToday={handleToday}
-                      onEdit={handleEdit} onDelete={id => setDeleteId(id)} />
+                  {allSectionTasks.map(task=>(
+                    <TaskCard key={task.id} task={task} {...commonCardProps}/>
                   ))}
                 </div>
               )}
@@ -800,23 +880,23 @@ export default function App() {
                 </div>
                 <span className="text-xs text-gray-400 flex-shrink-0">{wontDo.length} / {MAX_WONT_DO}</span>
               </div>
-              {wontDo.length > 0 && (
+              {wontDo.length>0 && (
                 <div className="divide-y divide-gray-100 mb-3">
-                  {wontDo.map(item => (
+                  {wontDo.map(item=>(
                     <div key={item.id} className="flex items-center gap-3 py-2.5">
                       <span className="flex-1 text-sm text-gray-700">{item.text}</span>
-                      <button onClick={() => setWontDo(prev => prev.filter(i => i.id !== item.id))}
+                      <button onClick={()=>setWontDo(prev=>prev.filter(i=>i.id!==item.id))}
                         className="text-gray-300 hover:text-red-400 p-0.5 flex-shrink-0"
-                      ><X size={15} /></button>
+                      ><X size={15}/></button>
                     </div>
                   ))}
                 </div>
               )}
-              {wontDo.length < MAX_WONT_DO ? (
-                <div className={`flex gap-2 ${wontDo.length > 0 ? 'pt-1' : ''}`}>
+              {wontDo.length<MAX_WONT_DO ? (
+                <div className={`flex gap-2 ${wontDo.length>0?'pt-1':''}`}>
                   <input type="text" value={wontDoInput}
-                    onChange={e => setWontDoInput(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && handleAddWontDo()}
+                    onChange={e=>setWontDoInput(e.target.value)}
+                    onKeyDown={e=>e.key==='Enter'&&handleAddWontDo()}
                     placeholder="やらないことを入力..."
                     className="flex-1 text-sm border border-gray-200 rounded-md px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-navy"
                   />
@@ -832,28 +912,32 @@ export default function App() {
         )}
       </main>
 
-      {/* ===== Modals / Dialogs ===== */}
+      {/* ===== モーダル / ダイアログ ===== */}
 
       {showModal && (
-        <TaskModal initial={editTask} onSave={handleSave}
-          onClose={() => { setShowModal(false); setEditTask(null) }} />
+        <TaskModal
+          initial={editTask}
+          knownAssignees={knownAssignees}
+          onSave={handleSave}
+          onClose={()=>{setShowModal(false);setEditTask(null)}}
+        />
       )}
 
-      {showTeachings && <TeachingsModal onClose={() => setShowTeachings(false)} />}
+      {showTeachings && <TeachingsModal onClose={()=>setShowTeachings(false)}/>}
 
       {deleteId && (
-        <Dialog icon={<AlertTriangle size={20} />} iconColor="text-red-500"
+        <Dialog icon={<AlertTriangle size={20}/>} iconColor="text-red-500"
           title="タスクを削除しますか？" body="この操作は元に戻せません。"
           confirmLabel="削除する" confirmClass="bg-red-500 text-white hover:bg-red-600"
-          onConfirm={handleDeleteConfirm} onCancel={() => setDeleteId(null)} />
+          onConfirm={handleDeleteConfirm} onCancel={()=>setDeleteId(null)}/>
       )}
 
       {todayWarn && (
-        <Dialog icon={<AlertTriangle size={20} />} iconColor="text-yellow-500"
+        <Dialog icon={<AlertTriangle size={20}/>} iconColor="text-yellow-500"
           title="「今日の3つ」は上限に達しています"
           body="今日やるタスクは3つまでです。既存のタスクを外してから追加してください。"
           confirmLabel="わかりました" confirmClass="bg-navy text-white hover:bg-navy-dark"
-          onConfirm={() => setTodayWarn(false)} onCancel={() => setTodayWarn(false)} />
+          onConfirm={()=>setTodayWarn(false)} onCancel={()=>setTodayWarn(false)}/>
       )}
     </div>
   )
