@@ -4,6 +4,7 @@ import {
   Plus, Pencil, Trash2, Check, Calendar, Download,
   AlertTriangle, X, BookOpen, List, BarChart2, GitBranch, Users, FileSpreadsheet,
   History, RotateCcw, Star, StarOff,
+  Cloud, CloudOff, Eye, EyeOff,
 } from 'lucide-react'
 
 // ============================================================
@@ -59,11 +60,21 @@ interface AppData {
   history: HistoryEntry[]
 }
 
+type SyncStatus = 'idle' | 'syncing' | 'success' | 'error' | 'disconnected'
+
+interface AppSettings {
+  githubToken: string
+  gistId: string
+  lastSynced: string | null
+}
+
 // ============================================================
 // Constants
 // ============================================================
 
 const STORAGE_KEY      = 'task-app-data'
+const SETTINGS_KEY     = 'task-app-settings'
+const GIST_FILENAME    = 'neumann-task-app.json'
 const MAX_TODAY        = 3
 const MAX_HISTORY      = 500   // 保持する履歴の最大件数
 
@@ -211,6 +222,73 @@ const loadData = (): AppData => {
 }
 
 const saveData = (data: AppData) => localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
+
+// ============================================================
+// Settings（Gist連携設定）
+// ============================================================
+
+const defaultSettings = (): AppSettings => ({ githubToken: '', gistId: '', lastSynced: null })
+
+const loadSettings = (): AppSettings => {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY)
+    return raw ? { ...defaultSettings(), ...JSON.parse(raw) } : defaultSettings()
+  } catch { return defaultSettings() }
+}
+
+const saveSettings = (s: AppSettings) => localStorage.setItem(SETTINGS_KEY, JSON.stringify(s))
+
+// ============================================================
+// GitHub Gist API
+// ============================================================
+
+const GIST_HEADERS = (token: string) => ({
+  Authorization: `token ${token}`,
+  'Content-Type': 'application/json',
+  Accept: 'application/vnd.github.v3+json',
+})
+
+/** トークンを検証し、GitHubユーザー名を返す（無効なら null） */
+async function gistValidateToken(token: string): Promise<string | null> {
+  try {
+    const res = await fetch('https://api.github.com/user', { headers: GIST_HEADERS(token) })
+    if (!res.ok) return null
+    const user = await res.json()
+    return user.login ?? null
+  } catch { return null }
+}
+
+/** Gistからデータを取得する */
+async function gistLoad(token: string, gistId: string): Promise<AppData | null> {
+  try {
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, { headers: GIST_HEADERS(token) })
+    if (!res.ok) return null
+    const gist = await res.json()
+    const content = gist.files?.[GIST_FILENAME]?.content
+    return content ? JSON.parse(content) as AppData : null
+  } catch { return null }
+}
+
+/** Gistにデータを保存し、Gist ID を返す（初回は自動作成） */
+async function gistSave(token: string, gistId: string, data: AppData): Promise<string> {
+  const body = JSON.stringify({
+    description: 'ノイマン式タスク管理 - 自動バックアップ',
+    public: false,
+    files: { [GIST_FILENAME]: { content: JSON.stringify(data, null, 2) } },
+  })
+  const headers = GIST_HEADERS(token)
+
+  if (gistId) {
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, { method: 'PATCH', headers, body })
+    if (!res.ok) throw new Error('Gist update failed')
+    return gistId
+  } else {
+    const res = await fetch('https://api.github.com/gists', { method: 'POST', headers, body })
+    if (!res.ok) throw new Error('Gist create failed')
+    const gist = await res.json()
+    return gist.id as string
+  }
+}
 
 // ============================================================
 // Export functions
@@ -801,6 +879,160 @@ const TreeView: React.FC<{
 }
 
 // ============================================================
+// GistSettingsModal
+// ============================================================
+
+interface GistSettingsModalProps {
+  settings: AppSettings
+  syncStatus: SyncStatus
+  onSave: (token: string, gistId: string) => void
+  onDisconnect: () => void
+  onClose: () => void
+}
+
+const GistSettingsModal: React.FC<GistSettingsModalProps> = ({
+  settings, syncStatus, onSave, onDisconnect, onClose,
+}) => {
+  const [token,      setToken]      = useState(settings.githubToken)
+  const [gistId,     setGistId]     = useState(settings.gistId)
+  const [showToken,  setShowToken]  = useState(false)
+  const [testing,    setTesting]    = useState(false)
+  const [testMsg,    setTestMsg]    = useState<{ ok: boolean; text: string } | null>(null)
+
+  const isConnected = !!settings.githubToken
+
+  const handleConnect = async () => {
+    if (!token.trim()) return
+    setTesting(true); setTestMsg(null)
+    const username = await gistValidateToken(token.trim())
+    if (username) {
+      setTestMsg({ ok: true, text: `✅ 接続成功（${username}）` })
+      onSave(token.trim(), gistId.trim())
+    } else {
+      setTestMsg({ ok: false, text: '❌ トークンが無効です。スコープに gist が含まれているか確認してください。' })
+    }
+    setTesting(false)
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-md">
+
+        {/* ヘッダー */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+          <div className="flex items-center gap-2">
+            <Cloud size={18} className="text-navy"/>
+            <h2 className="font-semibold text-gray-800">GitHub Gist 連携</h2>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1"><X size={18}/></button>
+        </div>
+
+        <div className="px-6 py-5 space-y-4">
+
+          {/* 接続中ステータス */}
+          {isConnected && (
+            <div className="bg-green-50 border border-green-200 rounded-lg px-4 py-3 text-sm">
+              <p className="font-medium text-green-700">✅ 接続中</p>
+              {settings.gistId && (
+                <p className="text-xs text-green-600 mt-0.5">
+                  Gist ID: <a href={`https://gist.github.com/${settings.gistId}`} target="_blank" rel="noreferrer"
+                    className="underline">{settings.gistId}</a>
+                </p>
+              )}
+              {settings.lastSynced && (
+                <p className="text-xs text-green-600 mt-0.5">最終同期: {fmtDateTime(settings.lastSynced)}</p>
+              )}
+              <p className="text-xs text-green-600 mt-0.5">
+                ステータス: {syncStatus === 'syncing' ? '同期中...' : syncStatus === 'error' ? '同期エラー' : '正常'}
+              </p>
+            </div>
+          )}
+
+          {/* トークン作成手順 */}
+          {!isConnected && (
+            <div className="bg-blue-50 border border-blue-100 rounded-lg px-4 py-3 text-xs text-blue-700 space-y-1.5">
+              <p className="font-bold text-sm">Personal Access Token の取得手順</p>
+              <ol className="list-decimal list-inside space-y-1 text-blue-600">
+                <li>GitHub → Settings → Developer settings</li>
+                <li>Personal access tokens → Tokens (classic)</li>
+                <li>「Generate new token」をクリック</li>
+                <li>スコープは <code className="bg-blue-100 px-1 rounded font-mono">gist</code> のみ選択（最小権限）</li>
+                <li>生成されたトークンをコピーして以下に貼り付け</li>
+              </ol>
+            </div>
+          )}
+
+          {/* トークン入力 */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">
+              Personal Access Token
+            </label>
+            <div className="flex gap-2 items-center">
+              <input
+                type={showToken ? 'text' : 'password'}
+                value={token}
+                onChange={e => { setToken(e.target.value); setTestMsg(null) }}
+                placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                className="flex-1 border border-gray-200 rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-navy"
+              />
+              <button onClick={() => setShowToken(v => !v)} className="text-gray-400 hover:text-gray-600 p-1">
+                {showToken ? <EyeOff size={16}/> : <Eye size={16}/>}
+              </button>
+            </div>
+            <p className="text-xs text-amber-600 mt-1">
+              ⚠️ トークンはこの端末の localStorage に保存されます（gistスコープのみ付与で被害を最小化）
+            </p>
+          </div>
+
+          {/* 既存 Gist ID（2台目用） */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">
+              既存の Gist ID
+              <span className="ml-1.5 text-xs text-gray-400 font-normal">2台目以降はここに入力 / 空白なら自動作成</span>
+            </label>
+            <input
+              type="text"
+              value={gistId}
+              onChange={e => setGistId(e.target.value)}
+              placeholder="例: a1b2c3d4e5f6... （1台目のGist設定画面で確認）"
+              className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-navy"
+            />
+          </div>
+
+          {/* テスト結果 */}
+          {testMsg && (
+            <p className={`text-sm leading-snug ${testMsg.ok ? 'text-green-600' : 'text-red-500'}`}>
+              {testMsg.text}
+            </p>
+          )}
+        </div>
+
+        {/* フッター */}
+        <div className="flex items-center justify-between px-6 py-4 border-t border-gray-100">
+          <div>
+            {isConnected && (
+              <button onClick={() => { onDisconnect(); onClose() }}
+                className="text-xs text-gray-400 hover:text-red-500 transition-colors">
+                連携を解除
+              </button>
+            )}
+          </div>
+          <div className="flex gap-2">
+            <button onClick={onClose} className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700">
+              {isConnected ? '閉じる' : 'キャンセル'}
+            </button>
+            <button onClick={handleConnect} disabled={!token.trim() || testing}
+              className="px-4 py-2 text-sm bg-navy text-white rounded-md hover:bg-navy-dark disabled:opacity-40 disabled:cursor-not-allowed">
+              {testing ? '確認中...' : isConnected ? 'トークンを更新' : '接続'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
 // HistoryModal — 操作履歴
 // ============================================================
 
@@ -962,19 +1194,99 @@ const Dialog: React.FC<DialogProps> = ({icon,iconColor,title,body,confirmLabel,c
 // ============================================================
 
 export default function App() {
-  const [tasks,        setTasks]        = useState<Task[]>([])
-  const [history,      setHistory]      = useState<HistoryEntry[]>([])
-  const [filter,       setFilter]       = useState<Filter>('all')
-  const [viewMode,     setViewMode]     = useState<ViewMode>('list')
-  const [showModal,    setShowModal]    = useState(false)
-  const [editTask,     setEditTask]     = useState<Task|null>(null)
-  const [deleteId,     setDeleteId]     = useState<string|null>(null)
-  const [todayWarn,    setTodayWarn]    = useState(false)
-  const [showTeachings,setShowTeachings]= useState(false)
-  const [showHistory,  setShowHistory]  = useState(false)
+  const [tasks,          setTasks]          = useState<Task[]>([])
+  const [history,        setHistory]        = useState<HistoryEntry[]>([])
+  const [settings,       setSettings]       = useState<AppSettings>(defaultSettings())
+  const [syncStatus,     setSyncStatus]     = useState<SyncStatus>('disconnected')
+  const [isLoaded,       setIsLoaded]       = useState(false)
+  const [filter,         setFilter]         = useState<Filter>('all')
+  const [viewMode,       setViewMode]       = useState<ViewMode>('list')
+  const [showModal,      setShowModal]      = useState(false)
+  const [editTask,       setEditTask]       = useState<Task|null>(null)
+  const [deleteId,       setDeleteId]       = useState<string|null>(null)
+  const [todayWarn,      setTodayWarn]      = useState(false)
+  const [showTeachings,  setShowTeachings]  = useState(false)
+  const [showHistory,    setShowHistory]    = useState(false)
+  const [showGistSettings, setShowGistSettings] = useState(false)
 
-  useEffect(()=>{ const d=loadData(); setTasks(d.tasks); setHistory(d.history) },[])
-  useEffect(()=>{ saveData({tasks, history}) },[tasks, history])
+  // settingsRef: sync effect 内で最新の settings を参照するため
+  const settingsRef = useRef<AppSettings>(defaultSettings())
+  useEffect(() => { settingsRef.current = settings }, [settings])
+
+  // 初期ロード：Gist設定があれば Gist 優先、なければ localStorage
+  useEffect(() => {
+    const s = loadSettings()
+    setSettings(s)
+    settingsRef.current = s
+
+    const doLoad = async () => {
+      if (s.githubToken && s.gistId) {
+        setSyncStatus('syncing')
+        try {
+          const data = await gistLoad(s.githubToken, s.gistId)
+          if (data) {
+            setTasks((data.tasks ?? []).map(t => ({
+              ...t,
+              memo:        (t as Task).memo        ?? '',
+              dueTime:     (t as Task).dueTime     ?? '',
+              parentId:    (t as Task).parentId    ?? null,
+              effort:      (t as Task).effort      ?? 0,
+              completedAt: (t as Task).completedAt ?? null,
+              assignee:    (t as Task).assignee    ?? DEFAULT_ASSIGNEE,
+            })))
+            setHistory(data.history ?? [])
+            setSyncStatus('success')
+            setTimeout(() => setSyncStatus('idle'), 2000)
+            setIsLoaded(true)
+            return
+          }
+        } catch {}
+        setSyncStatus('error')
+      } else if (s.githubToken) {
+        setSyncStatus('idle')   // トークンあり・Gist未作成
+      }
+      // localStorage フォールバック
+      const local = loadData()
+      setTasks(local.tasks)
+      setHistory(local.history)
+      setIsLoaded(true)
+    }
+    doLoad()
+  }, [])
+
+  // localStorage への保存
+  useEffect(() => {
+    if (!isLoaded) return
+    saveData({ tasks, history })
+  }, [tasks, history, isLoaded])
+
+  // Gist への自動同期（3秒デバウンス）
+  const syncTimer = useRef<ReturnType<typeof setTimeout>>()
+  useEffect(() => {
+    if (!isLoaded) return
+    const s = settingsRef.current
+    if (!s.githubToken) return
+
+    if (syncTimer.current) clearTimeout(syncTimer.current)
+    setSyncStatus('syncing')
+
+    syncTimer.current = setTimeout(async () => {
+      try {
+        const newGistId = await gistSave(s.githubToken, s.gistId, { tasks, history })
+        setSettings(prev => {
+          const next = { ...prev, gistId: newGistId, lastSynced: new Date().toISOString() }
+          saveSettings(next)
+          return next
+        })
+        setSyncStatus('success')
+        setTimeout(() => setSyncStatus('idle'), 3000)
+      } catch {
+        setSyncStatus('error')
+      }
+    }, 3000)
+
+    return () => { if (syncTimer.current) clearTimeout(syncTimer.current) }
+  }, [tasks, history, isLoaded])
 
   // 履歴エントリを先頭に追加（上限超えたら古いものを削除）
   const addHistory = (action: HistoryAction, task: Task, detail?: string) => {
@@ -983,6 +1295,20 @@ export default function App() {
       action, taskId: task.id, taskTitle: task.title, detail,
     }
     setHistory(prev => [entry, ...prev].slice(0, MAX_HISTORY))
+  }
+
+  // Gist 接続
+  const handleGistConnect = (token: string, gistId: string) => {
+    const next = { ...settings, githubToken: token, gistId }
+    setSettings(next); saveSettings(next)
+    // 即時同期をトリガー（isLoaded は true なので effect が走る）
+  }
+
+  // Gist 切断
+  const handleGistDisconnect = () => {
+    const next = defaultSettings()
+    setSettings(next); saveSettings(next)
+    setSyncStatus('disconnected')
   }
 
   const knownAssignees = [DEFAULT_ASSIGNEE,
@@ -1065,6 +1391,30 @@ export default function App() {
             <p className="text-xs text-blue-200 mt-0.5">{dateLabel}</p>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
+            {/* Gist 同期ステータス + 設定 */}
+            <button onClick={()=>setShowGistSettings(true)}
+              className={`flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md transition-colors ${
+                syncStatus==='error'   ? 'bg-red-500/30 hover:bg-red-500/40' :
+                syncStatus==='success' ? 'bg-green-500/20 hover:bg-green-500/30' :
+                'bg-white/10 hover:bg-white/20'
+              }`}
+              title="GitHub Gist 設定"
+            >
+              {syncStatus==='syncing'
+                ? <Cloud size={14} className="animate-pulse"/>
+                : settings.githubToken
+                  ? <Cloud size={14}/>
+                  : <CloudOff size={14} className="opacity-60"/>
+              }
+              <span className="hidden md:inline text-xs">
+                {syncStatus==='syncing'  ? '同期中...'
+                 :syncStatus==='success' ? '同期済み'
+                 :syncStatus==='error'   ? '同期失敗'
+                 :settings.githubToken  ? 'Gist接続中'
+                 :'Gist未設定'}
+              </span>
+            </button>
+
             <button onClick={()=>setShowTeachings(true)}
               className="flex items-center gap-1.5 text-sm bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-md transition-colors">
               <BookOpen size={14}/><span className="hidden md:inline">ノイマンの教え</span>
@@ -1172,6 +1522,15 @@ export default function App() {
           onSave={handleSave} onClose={()=>{setShowModal(false);setEditTask(null)}}/>
       )}
       {showTeachings && <TeachingsModal onClose={()=>setShowTeachings(false)}/>}
+      {showGistSettings && (
+        <GistSettingsModal
+          settings={settings}
+          syncStatus={syncStatus}
+          onSave={handleGistConnect}
+          onDisconnect={handleGistDisconnect}
+          onClose={()=>setShowGistSettings(false)}
+        />
+      )}
       {showHistory && (
         <HistoryModal
           history={history}
