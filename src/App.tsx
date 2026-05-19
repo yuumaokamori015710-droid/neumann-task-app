@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react'
+import * as XLSX from 'xlsx'
 import {
   Plus, Pencil, Trash2, Check, Calendar, Download,
-  AlertTriangle, X, BookOpen, List, BarChart2, GitBranch, Users,
+  AlertTriangle, X, BookOpen, List, BarChart2, GitBranch, Users, FileSpreadsheet,
 } from 'lucide-react'
 
 // ============================================================
@@ -22,17 +23,19 @@ interface CompletionCondition {
 interface Task {
   id: string
   title: string
-  dueDate: string       // 'YYYY-MM-DD'
+  memo: string              // フリーメモ
+  dueDate: string           // 'YYYY-MM-DD'
   dueTime: '' | 'AM' | 'PM'
   priority: Priority
   completed: boolean
+  completedAt: string | null  // 完了日時（ISO）
   isToday: boolean
   assignee: string
   parentId: string | null
   effort: EffortLevel
   completionCondition: CompletionCondition
   createdAt: string
-  // Future: status, reviewDate, retrospectiveMemo, roughApprovalMode
+  // Future: status, reviewDate, roughApprovalMode
 }
 
 interface AppData { tasks: Task[] }
@@ -57,12 +60,18 @@ const PRIORITY_CONFIG: Record<Priority, { label: string; badge: string; bar: str
 }
 
 const EFFORT_CONFIG: Record<number, { label: string; short: string; color: string }> = {
-  0: { label: '未設定',          short: '-',  color: 'bg-gray-100 text-gray-400' },
-  1: { label: 'S（〜1時間）',    short: 'S',  color: 'bg-green-100 text-green-600' },
-  2: { label: 'M（半日程度）',   short: 'M',  color: 'bg-blue-100 text-blue-600' },
-  3: { label: 'L（1日程度）',    short: 'L',  color: 'bg-orange-100 text-orange-600' },
-  5: { label: 'XL（複数日）',    short: 'XL', color: 'bg-red-100 text-red-600' },
+  0: { label: '未設定',        short: '-',  color: 'bg-gray-100 text-gray-400' },
+  1: { label: 'S（〜1時間）',  short: 'S',  color: 'bg-green-100 text-green-600' },
+  2: { label: 'M（半日程度）', short: 'M',  color: 'bg-blue-100 text-blue-600' },
+  3: { label: 'L（1日程度）',  short: 'L',  color: 'bg-orange-100 text-orange-600' },
+  5: { label: 'XL（複数日）',  short: 'XL', color: 'bg-red-100 text-red-600' },
 }
+
+const TEACHINGS = [
+  { num: '①', title: '入口を減らす',       principle: '並行作業を減らすべし。',          example: '現在進行中のタスク数に厳格な上限を設け、それ以外の依頼は一旦別のストック場所に置く。' },
+  { num: '②', title: '制約を先に固定する', principle: '迷いを遮断すべし。',              example: '「今日はこの領域以外には手を出さない」といった制約を最初に設定し、判断の計算資源を節約する。' },
+  { num: '③', title: '他者の頭脳を組み込む', principle: '自分一人で完結させないべし。', example: '6割程度の思考ができた段階で他者に共有し、前提のズレや抜け漏れを早い段階で指摘してもらう。' },
+]
 
 // ============================================================
 // Utilities
@@ -82,10 +91,13 @@ const isThisWeek = (d: string): boolean => {
   return date >= mon && date <= sun
 }
 
-const isOverdue = (d: string) => !!d && d < todayStr()
+const isOverdue  = (d: string) => !!d && d < todayStr()
 
 const fmtDate = (d: string) =>
   d ? new Date(d+'T00:00:00').toLocaleDateString('ja-JP',{month:'short',day:'numeric'}) : ''
+
+const fmtDateTime = (iso: string) =>
+  new Date(iso).toLocaleString('ja-JP',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
 
 const fmtCondition = (cc: CompletionCondition) => {
   const v = cc.verb==='other' ? cc.verbCustom : cc.verb
@@ -102,7 +114,7 @@ function wouldCreateCycle(taskId: string, proposedParentId: string, tasks: Task[
     if (cur === taskId) return true
     if (visited.has(cur)) return false
     visited.add(cur)
-    cur = tasks.find(t => t.id === cur)?.parentId ?? null
+    cur = tasks.find(t=>t.id===cur)?.parentId ?? null
   }
   return false
 }
@@ -110,37 +122,32 @@ function wouldCreateCycle(taskId: string, proposedParentId: string, tasks: Task[
 function getPathEffort(taskId: string, tasks: Task[], visited = new Set<string>()): number {
   if (visited.has(taskId)) return 0
   visited.add(taskId)
-  const task = tasks.find(t => t.id === taskId)
+  const task = tasks.find(t=>t.id===taskId)
   if (!task) return 0
   const own = task.effort as number
   if (!task.parentId) return own
   return own + getPathEffort(task.parentId, tasks, visited)
 }
 
-const NODE_W = 200, NODE_H = 84, H_GAP = 28, V_GAP = 72
+const NODE_W = 200, NODE_H = 88, H_GAP = 28, V_GAP = 72
 
 function buildTreeLayout(tasks: Task[]): Map<string, { x: number; y: number }> {
   const pos = new Map<string, { x: number; y: number }>()
   let nextLeafX = 0
-
   const layOut = (id: string, depth: number): number => {
-    const children = tasks.filter(t => t.parentId === id)
-    if (children.length === 0) {
+    const children = tasks.filter(t=>t.parentId===id)
+    if (children.length===0) {
       pos.set(id, { x: nextLeafX, y: depth*(NODE_H+V_GAP) })
       const cx = nextLeafX + NODE_W/2
       nextLeafX += NODE_W + H_GAP
       return cx
     }
-    const cxs = children.map(c => layOut(c.id, depth+1))
+    const cxs = children.map(c=>layOut(c.id, depth+1))
     const center = (cxs[0] + cxs[cxs.length-1]) / 2
     pos.set(id, { x: center - NODE_W/2, y: depth*(NODE_H+V_GAP) })
     return center
   }
-
-  tasks.filter(t => !t.parentId).forEach(r => {
-    layOut(r.id, 0)
-    nextLeafX += H_GAP
-  })
+  tasks.filter(t=>!t.parentId).forEach(r=>{layOut(r.id,0); nextLeafX+=H_GAP})
   return pos
 }
 
@@ -155,10 +162,12 @@ const loadData = (): AppData => {
     const data = JSON.parse(raw) as AppData
     data.tasks = (data.tasks ?? []).map(t => ({
       ...t,
-      assignee:  t.assignee  ?? DEFAULT_ASSIGNEE,
-      dueTime:   (t as Task).dueTime  ?? '',
-      parentId:  (t as Task).parentId ?? null,
-      effort:    (t as Task).effort   ?? 0,
+      memo:        (t as Task).memo        ?? '',
+      assignee:    (t as Task).assignee    ?? DEFAULT_ASSIGNEE,
+      dueTime:     (t as Task).dueTime     ?? '',
+      parentId:    (t as Task).parentId    ?? null,
+      effort:      (t as Task).effort      ?? 0,
+      completedAt: (t as Task).completedAt ?? null,
     }))
     return data
   } catch { return { tasks: [] } }
@@ -166,23 +175,48 @@ const loadData = (): AppData => {
 
 const saveData = (data: AppData) => localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
 
+// ============================================================
+// Export functions
+// ============================================================
+
+const toExportRow = (t: Task) => ({
+  'タイトル':    t.title,
+  '宛先':        t.assignee,
+  'メモ':        t.memo,
+  '優先度':      PRIORITY_CONFIG[t.priority].label,
+  '期限':        t.dueDate,
+  '時間帯':      t.dueTime,
+  '完了':        t.completed ? '完了' : '未完了',
+  '完了日時':    t.completedAt ? fmtDateTime(t.completedAt) : '',
+  '今日の3つ':   t.isToday ? 'はい' : 'いいえ',
+  '労力':        EFFORT_CONFIG[t.effort]?.short ?? '-',
+  '完了条件':    fmtCondition(t.completionCondition),
+  '作成日':      t.createdAt.split('T')[0],
+})
+
 const handleExportCSV = (tasks: Task[]) => {
-  const headers = ['タイトル','宛先','優先度','期限','時間帯','完了','今日の3つ','労力','完了条件','作成日']
-  const rows = tasks.map(t => [
-    `"${t.title.replace(/"/g,'""')}"`,
-    t.assignee, PRIORITY_CONFIG[t.priority].label,
-    t.dueDate, t.dueTime,
-    t.completed?'完了':'未完了', t.isToday?'はい':'いいえ',
-    EFFORT_CONFIG[t.effort]?.short ?? '-',
-    `"${fmtCondition(t.completionCondition).replace(/"/g,'""')}"`,
-    t.createdAt.split('T')[0],
-  ])
-  const csv = [headers,...rows].map(r=>r.join(',')).join('\n')
+  const rows = tasks.map(toExportRow)
+  const headers = Object.keys(rows[0] ?? {})
+  const csv = [headers, ...rows.map(r => headers.map(h => `"${String((r as Record<string,string>)[h] ?? '').replace(/"/g,'""')}"`))]
+    .map(r=>r.join(',')).join('\n')
   const blob = new Blob(['﻿'+csv],{type:'text/csv;charset=utf-8;'})
   const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href=url; a.download=`tasks-${todayStr()}.csv`; a.click()
+  const a = document.createElement('a'); a.href=url; a.download=`tasks-${todayStr()}.csv`; a.click()
   URL.revokeObjectURL(url)
+}
+
+const handleExportExcel = (tasks: Task[]) => {
+  const rows = tasks.map(toExportRow)
+  const ws = XLSX.utils.json_to_sheet(rows)
+  // 列幅設定
+  ws['!cols'] = [
+    {wch:32},{wch:12},{wch:40},{wch:8},{wch:12},{wch:8},
+    {wch:8},{wch:20},{wch:10},{wch:8},{wch:32},{wch:12},
+  ]
+  // ヘッダー行のスタイル（背景色）
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, 'タスク一覧')
+  XLSX.writeFile(wb, `neumann-tasks-${todayStr()}.xlsx`)
 }
 
 // ============================================================
@@ -216,8 +250,8 @@ const ConditionSelect: React.FC<ConditionSelectProps> = ({label,options,value,cu
 
 const emptyCC = (): CompletionCondition => ({verb:'',verbCustom:'',target:'',targetCustom:'',state:'',stateCustom:''})
 const makeNewTask = (): Task => ({
-  id:genId(), title:'', dueDate:'', dueTime:'', priority:'medium',
-  completed:false, isToday:false, assignee:DEFAULT_ASSIGNEE,
+  id:genId(), title:'', memo:'', dueDate:'', dueTime:'', priority:'medium',
+  completed:false, completedAt:null, isToday:false, assignee:DEFAULT_ASSIGNEE,
   parentId:null, effort:0, completionCondition:emptyCC(),
   createdAt: new Date().toISOString(),
 })
@@ -241,25 +275,21 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, allTasks, knownAssignees
 
   const cc = form.completionCondition
   const setCC = (f: keyof CompletionCondition, v: string) =>
-    setForm(p => ({...p, completionCondition:{...p.completionCondition,[f]:v}}))
+    setForm(p=>({...p, completionCondition:{...p.completionCondition,[f]:v}}))
   const preview = fmtCondition(cc)
 
-  const availableParents = allTasks.filter(t =>
-    t.id !== form.id && !wouldCreateCycle(form.id, t.id, allTasks)
-  )
-
-  const effectiveAssignee = assigneeMode==='new'
-    ? (newAssigneeDraft.trim() || DEFAULT_ASSIGNEE)
-    : form.assignee
+  const availableParents = allTasks.filter(t => t.id!==form.id && !wouldCreateCycle(form.id, t.id, allTasks))
+  const effectiveAssignee = assigneeMode==='new' ? (newAssigneeDraft.trim() || DEFAULT_ASSIGNEE) : form.assignee
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-lg shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-xl max-h-[92vh] overflow-y-auto">
         <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
           <h2 className="font-semibold text-gray-800">{initial?'タスクを編集':'タスクを追加'}</h2>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1"><X size={18}/></button>
         </div>
         <div className="px-6 py-5 space-y-4">
+
           {/* タスク名 */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1.5">タスク名 <span className="text-red-400">*</span></label>
@@ -268,6 +298,17 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, allTasks, knownAssignees
               placeholder="タスク名を入力..."
               className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy"/>
           </div>
+
+          {/* メモ */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">メモ</label>
+            <textarea value={form.memo}
+              onChange={e=>setForm(p=>({...p,memo:e.target.value}))}
+              placeholder="補足・背景・リンクなど自由記述..."
+              rows={3}
+              className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy resize-y"/>
+          </div>
+
           {/* 宛先 */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1.5">宛先</label>
@@ -289,6 +330,7 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, allTasks, knownAssignees
               )}
             </div>
           </div>
+
           {/* 期限日・時間帯・優先度 */}
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -299,9 +341,7 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, allTasks, knownAssignees
                   className="flex-1 min-w-0 border border-gray-200 rounded-md px-2 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy"/>
                 <select value={form.dueTime} onChange={e=>setForm(p=>({...p,dueTime:e.target.value as Task['dueTime']}))}
                   className="w-20 border border-gray-200 rounded-md px-1 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy bg-white">
-                  <option value="">-</option>
-                  <option value="AM">AM</option>
-                  <option value="PM">PM</option>
+                  <option value="">-</option><option value="AM">AM</option><option value="PM">PM</option>
                 </select>
               </div>
             </div>
@@ -313,11 +353,12 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, allTasks, knownAssignees
               </select>
             </div>
           </div>
+
           {/* 親タスク・労力 */}
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1.5">親タスク</label>
-              <select value={form.parentId ?? ''}
+              <select value={form.parentId??''}
                 onChange={e=>setForm(p=>({...p,parentId:e.target.value||null}))}
                 className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy bg-white">
                 <option value="">なし（ルート）</option>
@@ -332,6 +373,7 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, allTasks, knownAssignees
               </select>
             </div>
           </div>
+
           {/* 完了条件 */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-2">完了条件</label>
@@ -347,6 +389,7 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, allTasks, knownAssignees
             )}
           </div>
         </div>
+
         <div className="flex justify-end gap-2 px-6 py-4 border-t border-gray-100">
           <button onClick={onClose} className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700">キャンセル</button>
           <button onClick={()=>form.title.trim()&&onSave({...form,assignee:effectiveAssignee})}
@@ -370,46 +413,95 @@ interface TaskCardProps {
   onEdit:(t:Task)=>void; onDelete:(id:string)=>void
   hideAssignee?: boolean
 }
+
 const TaskCard: React.FC<TaskCardProps> = ({task,onComplete,onToday,onEdit,onDelete,hideAssignee=false}) => {
-  const pc      = PRIORITY_CONFIG[task.priority]
-  const ec      = EFFORT_CONFIG[task.effort]
-  const cond    = fmtCondition(task.completionCondition)
-  const overdue = !task.completed && isOverdue(task.dueDate)
+  const pc         = PRIORITY_CONFIG[task.priority]
+  const ec         = EFFORT_CONFIG[task.effort]
+  const cond       = fmtCondition(task.completionCondition)
+  const overdue    = !task.completed && isOverdue(task.dueDate)
+  const todayDue   = !task.completed && !!task.dueDate && isToday(task.dueDate)
+
   return (
-    <div className={`bg-white border border-gray-200 rounded-md px-4 py-3 flex gap-3 items-start ${task.completed?'opacity-50':''}`}>
-      <button onClick={()=>onComplete(task.id)}
-        className={`mt-0.5 w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 transition-colors ${task.completed?'bg-navy border-navy':'border-gray-300 hover:border-navy'}`}>
-        {task.completed && <Check size={11} className="text-white"/>}
-      </button>
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-1.5 flex-wrap">
-          <span className={`text-sm font-medium ${task.completed?'line-through text-gray-400':'text-gray-800'}`}>{task.title}</span>
-          <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${pc.badge}`}>{pc.label}</span>
-          {task.effort>0 && <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${ec.color}`}>{ec.short}</span>}
-          {!hideAssignee && task.assignee!==DEFAULT_ASSIGNEE && (
-            <span className="text-xs px-1.5 py-0.5 rounded bg-navy/10 text-navy flex-shrink-0">→ {task.assignee}</span>
+    <div className={[
+      'rounded-md overflow-hidden border-2 transition-all',
+      task.completed       ? 'opacity-50 border-gray-200'            : '',
+      todayDue             ? 'border-red-500 urgent-glow'            : (!task.completed ? 'border-gray-200' : ''),
+    ].join(' ')}>
+
+      {/* 今日締め切りバナー */}
+      {todayDue && (
+        <div className="flex items-center gap-2 bg-red-500 text-white text-sm font-bold px-4 py-2">
+          <span className="animate-bounce inline-block text-base">🔥</span>
+          今日が締め切りです！
+          <span className="animate-bounce inline-block text-base">🔥</span>
+        </div>
+      )}
+
+      <div className="bg-white px-4 py-3 flex gap-3 items-start">
+        {/* チェックボックス */}
+        <button onClick={()=>onComplete(task.id)}
+          className={`mt-0.5 w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 transition-colors ${
+            task.completed ? 'bg-navy border-navy' : 'border-gray-300 hover:border-navy'
+          }`}>
+          {task.completed && <Check size={11} className="text-white"/>}
+        </button>
+
+        {/* 本文 */}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className={`text-sm font-medium ${task.completed?'line-through text-gray-400':todayDue?'text-red-700':'text-gray-800'}`}>
+              {task.title}
+            </span>
+            <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${pc.badge}`}>{pc.label}</span>
+            {task.effort>0 && <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${ec.color}`}>{ec.short}</span>}
+            {!hideAssignee && task.assignee!==DEFAULT_ASSIGNEE && (
+              <span className="text-xs px-1.5 py-0.5 rounded bg-navy/10 text-navy flex-shrink-0">→ {task.assignee}</span>
+            )}
+          </div>
+
+          {/* 完了条件 */}
+          {cond && <p className="text-xs text-gray-400 mt-0.5 truncate">完了条件: {cond}</p>}
+
+          {/* 期限 */}
+          {task.dueDate && (
+            <div className={`flex items-center gap-1 mt-1 text-xs font-medium ${
+              todayDue ? 'text-red-600' : overdue ? 'text-red-500' : 'text-gray-400'
+            }`}>
+              <Calendar size={11}/>
+              <span>{fmtDate(task.dueDate)}{task.dueTime?` ${task.dueTime}`:''}{overdue&&!todayDue?'（期限切れ）':''}</span>
+            </div>
+          )}
+
+          {/* メモ */}
+          {task.memo && (
+            <div className="mt-1.5 text-xs text-gray-600 bg-gray-50 rounded px-2 py-1.5 whitespace-pre-wrap line-clamp-3 leading-relaxed">
+              {task.memo}
+            </div>
+          )}
+
+          {/* 完了日時 */}
+          {task.completed && task.completedAt && (
+            <p className="text-xs text-gray-400 mt-1">✓ {fmtDateTime(task.completedAt)} に完了</p>
           )}
         </div>
-        {cond && <p className="text-xs text-gray-400 mt-0.5 truncate">完了条件: {cond}</p>}
-        {task.dueDate && (
-          <div className={`flex items-center gap-1 mt-1 text-xs ${overdue?'text-red-500':'text-gray-400'}`}>
-            <Calendar size={11}/>
-            <span>{fmtDate(task.dueDate)}{task.dueTime?` ${task.dueTime}`:''}{overdue?'（期限切れ）':''}</span>
-          </div>
-        )}
-      </div>
-      <div className="flex items-center gap-1 flex-shrink-0">
-        <button onClick={()=>onToday(task.id)} title={task.isToday?'今日の3つから外す':'今日の3つに追加'}
-          className={`text-xs px-2 py-1 rounded transition-colors ${task.isToday?'bg-navy text-white':'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}>今日</button>
-        <button onClick={()=>onEdit(task)} className="p-1 text-gray-400 hover:text-gray-700"><Pencil size={14}/></button>
-        <button onClick={()=>onDelete(task.id)} className="p-1 text-gray-400 hover:text-red-500"><Trash2 size={14}/></button>
+
+        {/* アクション */}
+        <div className="flex items-center gap-1 flex-shrink-0">
+          <button onClick={()=>onToday(task.id)}
+            title={task.isToday?'今日の3つから外す':'今日の3つに追加'}
+            className={`text-xs px-2 py-1 rounded transition-colors ${task.isToday?'bg-navy text-white':'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}>
+            今日
+          </button>
+          <button onClick={()=>onEdit(task)} className="p-1 text-gray-400 hover:text-gray-700"><Pencil size={14}/></button>
+          <button onClick={()=>onDelete(task.id)} className="p-1 text-gray-400 hover:text-red-500"><Trash2 size={14}/></button>
+        </div>
       </div>
     </div>
   )
 }
 
 // ============================================================
-// AssigneeColumns — used in list view for 全タスク
+// AssigneeColumns（全タスク用）
 // ============================================================
 
 interface AssigneeColsProps {
@@ -417,14 +509,16 @@ interface AssigneeColsProps {
   onComplete:(id:string)=>void; onToday:(id:string)=>void
   onEdit:(t:Task)=>void; onDelete:(id:string)=>void
 }
+
 const AssigneeCols: React.FC<AssigneeColsProps> = ({tasks,knownAssignees,onComplete,onToday,onEdit,onDelete}) => {
   const cols = knownAssignees
-    .map(a => ({ assignee:a, tasks:tasks.filter(t=>t.assignee===a) }))
+    .map(a=>({assignee:a, tasks:tasks.filter(t=>t.assignee===a)}))
     .filter(c=>c.tasks.length>0)
 
-  if (cols.length===0) return (
+  if (!cols.length) return (
     <div className="text-center py-12 text-gray-400 text-sm">タスクがありません</div>
   )
+
   return (
     <div className="overflow-x-auto pb-2">
       <div className="flex gap-4" style={{minWidth:'max-content'}}>
@@ -432,7 +526,7 @@ const AssigneeCols: React.FC<AssigneeColsProps> = ({tasks,knownAssignees,onCompl
           const active = ct.filter(t=>!t.completed).length
           const isSelf = assignee===DEFAULT_ASSIGNEE
           return (
-            <div key={assignee} className="w-72 flex-shrink-0">
+            <div key={assignee} className="w-80 flex-shrink-0">
               <div className={`flex items-center justify-between px-3 py-2 rounded-lg mb-2 ${isSelf?'bg-navy/10':'bg-amber-50 border border-amber-200'}`}>
                 <div className="flex items-center gap-2">
                   <Users size={13} className={isSelf?'text-navy':'text-amber-600'}/>
@@ -481,14 +575,18 @@ const GanttChart: React.FC<{tasks:Task[]}> = ({tasks}) => {
   return (
     <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
       <div className="flex">
-        <div className="w-44 flex-shrink-0 border-r border-gray-100 bg-white">
+        <div className="w-48 flex-shrink-0 border-r border-gray-100 bg-white">
           <div className="h-9 bg-gray-50 border-b border-gray-200"/>
-          {withDates.map(task=>(
-            <div key={task.id} className={`flex items-center gap-1.5 px-3 border-b border-gray-100 ${task.completed?'opacity-40':''}`} style={{height:ROW_H}}>
-              {task.isToday && <span className="w-1.5 h-1.5 rounded-full bg-navy flex-shrink-0"/>}
-              <span className="text-xs text-gray-700 truncate">{task.title}</span>
-            </div>
-          ))}
+          {withDates.map(task=>{
+            const td = !task.completed&&!!task.dueDate&&isToday(task.dueDate)
+            return (
+              <div key={task.id} className={`flex items-center gap-1.5 px-3 border-b border-gray-100 ${task.completed?'opacity-40':''} ${td?'bg-red-50':''}`} style={{height:ROW_H}}>
+                {task.isToday&&<span className="w-1.5 h-1.5 rounded-full bg-navy flex-shrink-0"/>}
+                {td&&<span className="text-red-500 flex-shrink-0">🔥</span>}
+                <span className={`text-xs truncate ${td?'text-red-700 font-semibold':'text-gray-700'}`}>{task.title}</span>
+              </div>
+            )
+          })}
         </div>
         <div ref={scrollRef} className="flex-1 overflow-x-auto">
           <div style={{width:chartWidth}}>
@@ -510,13 +608,17 @@ const GanttChart: React.FC<{tasks:Task[]}> = ({tasks}) => {
                 const barW=endX-x
                 const pc=PRIORITY_CONFIG[task.priority]
                 const overdue=!task.completed&&isOverdue(task.dueDate)
+                const td=!task.completed&&isToday(task.dueDate)
                 return (
-                  <div key={task.id} className="relative border-b border-gray-100" style={{height:ROW_H}}>
-                    <div className={`absolute h-6 top-[10px] rounded flex items-center ${task.completed?pc.barDone+' opacity-50':pc.bar}`} style={{left:x,width:barW}} title={`${task.title} 期限:${fmtDate(task.dueDate)}${task.dueTime?' '+task.dueTime:''}`}>
+                  <div key={task.id} className={`relative border-b border-gray-100 ${td?'bg-red-50':''}`} style={{height:ROW_H}}>
+                    <div className={`absolute h-6 top-[10px] rounded flex items-center ${task.completed?pc.barDone+' opacity-50':td?'bg-red-500':pc.bar}`}
+                      style={{left:x,width:barW}} title={`${task.title}`}>
                       {task.completed&&<Check size={11} className="ml-1.5 text-gray-600 flex-shrink-0"/>}
                     </div>
-                    {overdue&&<div className="absolute w-1.5 h-6 top-[10px] bg-red-600 rounded-r opacity-70 z-10" style={{left:endX-6}}/>}
-                    <span className={`absolute text-xs top-[12px] whitespace-nowrap ${overdue?'text-red-500':'text-gray-400'}`} style={{left:endX+4}}>{fmtDate(task.dueDate)}{task.dueTime?' '+task.dueTime:''}</span>
+                    {overdue&&!td&&<div className="absolute w-1.5 h-6 top-[10px] bg-red-600 rounded-r opacity-70 z-10" style={{left:endX-6}}/>}
+                    <span className={`absolute text-xs top-[12px] whitespace-nowrap ${td?'text-red-600 font-medium':overdue?'text-red-500':'text-gray-400'}`} style={{left:endX+4}}>
+                      {fmtDate(task.dueDate)}{task.dueTime?' '+task.dueTime:''}
+                    </span>
                   </div>
                 )
               })}
@@ -527,99 +629,73 @@ const GanttChart: React.FC<{tasks:Task[]}> = ({tasks}) => {
       <div className="flex items-center gap-4 px-4 py-2.5 border-t border-gray-100 bg-gray-50 text-xs text-gray-400">
         <div className="flex items-center gap-1.5"><div className="w-0.5 h-4 bg-red-400 opacity-75"/><span>今日</span></div>
         <div className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-navy"/><span>今日の3つ</span></div>
-        <div className="flex items-center gap-1.5"><div className="w-1.5 h-4 bg-red-600 rounded opacity-70"/><span>期限切れ</span></div>
+        <div className="flex items-center gap-1.5"><span>🔥</span><span>今日締め切り</span></div>
       </div>
     </div>
   )
 }
 
 // ============================================================
-// TreeView — 依存関係・パス労力可視化
+// TreeView
 // ============================================================
 
 const TreeView: React.FC<{
-  tasks: Task[]
-  onSetParent: (taskId:string, parentId:string|null)=>void
-  onEdit: (t:Task)=>void
+  tasks:Task[]
+  onSetParent:(taskId:string,parentId:string|null)=>void
+  onEdit:(t:Task)=>void
 }> = ({tasks,onSetParent,onEdit}) => {
-  const [draggingId,  setDraggingId]  = useState<string|null>(null)
-  const [dropTargetId,setDropTargetId]= useState<string|null>(null)
+  const [draggingId,   setDraggingId]  = useState<string|null>(null)
+  const [dropTargetId, setDropTargetId]= useState<string|null>(null)
 
   const positions = buildTreeLayout(tasks)
+  let maxX=0,maxY=0
+  for(const [,p] of positions){maxX=Math.max(maxX,p.x+NODE_W);maxY=Math.max(maxY,p.y+NODE_H)}
+  const canvasW = maxX+H_GAP*2, canvasH = maxY+V_GAP
 
-  // Canvas size
-  let maxX = 0, maxY = 0
-  for(const [,p] of positions){ maxX=Math.max(maxX,p.x+NODE_W); maxY=Math.max(maxY,p.y+NODE_H) }
-  const canvasW = maxX + H_GAP*2
-  const canvasH = maxY + V_GAP
-
-  // Path effort for every node
-  const pathEffortMap = new Map(tasks.map(t=>[t.id, getPathEffort(t.id,tasks)]))
-
-  // Leaves and their efforts (for path comparison)
+  const pathEffortMap = new Map(tasks.map(t=>[t.id,getPathEffort(t.id,tasks)]))
   const leaves = tasks.filter(t=>!tasks.some(o=>o.parentId===t.id))
   const leafEfforts = leaves.map(l=>pathEffortMap.get(l.id)??0).filter(e=>e>0)
-  const minE = leafEfforts.length ? Math.min(...leafEfforts) : -1
-  const maxE = leafEfforts.length ? Math.max(...leafEfforts) : -1
+  const minE = leafEfforts.length?Math.min(...leafEfforts):-1
+  const maxE = leafEfforts.length?Math.max(...leafEfforts):-1
 
-  const handleDrop = (targetId: string|null) => {
+  const handleDrop = (targetId:string|null) => {
     if(!draggingId) return
     if(targetId===draggingId){setDraggingId(null);setDropTargetId(null);return}
-    if(targetId && wouldCreateCycle(draggingId,targetId,tasks)){setDraggingId(null);setDropTargetId(null);return}
-    onSetParent(draggingId, targetId)
-    setDraggingId(null); setDropTargetId(null)
+    if(targetId&&wouldCreateCycle(draggingId,targetId,tasks)){setDraggingId(null);setDropTargetId(null);return}
+    onSetParent(draggingId,targetId)
+    setDraggingId(null);setDropTargetId(null)
   }
 
-  if(!tasks.length) return (
-    <div className="text-center py-12 text-gray-400 text-sm">タスクを追加してください</div>
-  )
+  if(!tasks.length) return <div className="text-center py-12 text-gray-400 text-sm">タスクを追加してください</div>
 
   return (
     <div className="space-y-3">
-      {/* 凡例 */}
       <div className="flex items-center gap-4 text-xs text-gray-500 flex-wrap">
         <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm bg-green-100 border border-green-400 inline-block"/>最軽パス</span>
         <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm bg-red-100 border border-red-300 inline-block"/>最重パス</span>
-        <span className="text-gray-400">ドラッグ → 別タスクにドロップで親子関係を設定 / 空白ドロップでルートに戻す</span>
+        <span className="text-gray-400">ドラッグ→別タスクにドロップで親子関係設定 / 空白ドロップでルートに戻す</span>
       </div>
-
-      {/* チャートエリア */}
       <div className="border border-gray-200 rounded-lg bg-gray-50 overflow-auto"
-        onDragOver={e=>e.preventDefault()}
-        onDrop={()=>handleDrop(null)}
-        style={{minHeight: Math.max(canvasH+32,200)}}
-      >
-        <div className="relative m-4" style={{width:canvasW, height:canvasH}}>
-
-          {/* SVG 接続線 */}
+        onDragOver={e=>e.preventDefault()} onDrop={()=>handleDrop(null)}
+        style={{minHeight:Math.max(canvasH+32,200)}}>
+        <div className="relative m-4" style={{width:canvasW,height:canvasH}}>
           <svg className="absolute inset-0 pointer-events-none" width={canvasW} height={canvasH}>
             {tasks.filter(t=>t.parentId).map(task=>{
-              const cp = positions.get(task.id)
-              const pp = positions.get(task.parentId!)
+              const cp=positions.get(task.id),pp=positions.get(task.parentId!)
               if(!cp||!pp) return null
-              const x1=pp.x+NODE_W/2, y1=pp.y+NODE_H
-              const x2=cp.x+NODE_W/2, y2=cp.y
-              const my=(y1+y2)/2
-              return (
-                <path key={task.id}
-                  d={`M${x1} ${y1} C${x1} ${my},${x2} ${my},${x2} ${y2}`}
-                  fill="none" stroke="#cbd5e1" strokeWidth="1.5"/>
-              )
+              const x1=pp.x+NODE_W/2,y1=pp.y+NODE_H,x2=cp.x+NODE_W/2,y2=cp.y,my=(y1+y2)/2
+              return <path key={task.id} d={`M${x1} ${y1} C${x1} ${my},${x2} ${my},${x2} ${y2}`} fill="none" stroke="#cbd5e1" strokeWidth="1.5"/>
             })}
           </svg>
-
-          {/* ノード */}
           {tasks.map(task=>{
-            const pos = positions.get(task.id)
+            const pos=positions.get(task.id)
             if(!pos) return null
-            const isLeaf    = !tasks.some(t=>t.parentId===task.id)
-            const pathE     = pathEffortMap.get(task.id)??0
-            const isMinLeaf = isLeaf && pathE===minE && minE>0
-            const isMaxLeaf = isLeaf && pathE===maxE && maxE>0 && minE!==maxE
-            const ec        = EFFORT_CONFIG[task.effort]
-            const isDragging= draggingId===task.id
-            const isTarget  = dropTargetId===task.id
-
+            const isLeaf=!tasks.some(t=>t.parentId===task.id)
+            const pathE=pathEffortMap.get(task.id)??0
+            const isMinLeaf=isLeaf&&pathE===minE&&minE>0
+            const isMaxLeaf=isLeaf&&pathE===maxE&&maxE>0&&minE!==maxE
+            const ec=EFFORT_CONFIG[task.effort]
+            const td=!task.completed&&!!task.dueDate&&isToday(task.dueDate)
             return (
               <div key={task.id}
                 draggable
@@ -628,47 +704,31 @@ const TreeView: React.FC<{
                 onDragOver={e=>{e.preventDefault();e.stopPropagation();setDropTargetId(task.id)}}
                 onDrop={e=>{e.stopPropagation();handleDrop(task.id)}}
                 style={{position:'absolute',left:pos.x,top:pos.y,width:NODE_W,height:NODE_H}}
-                className={[
-                  'bg-white rounded-lg border-2 p-2.5 cursor-grab select-none flex flex-col justify-between',
-                  isTarget  ? 'border-navy bg-navy/5 shadow-md' : '',
-                  isDragging? 'opacity-40 border-gray-200' : 'border-gray-200 shadow-sm hover:shadow',
-                  isMinLeaf ? 'ring-2 ring-green-400' : '',
-                  isMaxLeaf ? 'ring-2 ring-red-300'   : '',
+                className={['bg-white rounded-lg border-2 cursor-grab select-none flex flex-col overflow-hidden',
+                  dropTargetId===task.id?'border-navy bg-navy/5 shadow-md':'',
+                  draggingId===task.id?'opacity-40 border-gray-200':'border-gray-200 shadow-sm hover:shadow',
+                  isMinLeaf?'ring-2 ring-green-400':'',isMaxLeaf?'ring-2 ring-red-300':'',
+                  td?'border-red-500':'',
                 ].join(' ')}
               >
-                {/* 上段: タイトル + 労力 */}
-                <div className="flex items-start gap-1.5">
-                  <p className="text-xs font-semibold text-gray-800 flex-1 leading-tight line-clamp-2">{task.title}</p>
-                  {task.effort>0 && (
-                    <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 font-medium ${ec.color}`}>{ec.short}</span>
-                  )}
-                </div>
-
-                {/* 中段: 宛先・期限 */}
-                <div className="flex items-center gap-2 flex-wrap mt-1">
-                  {task.assignee!==DEFAULT_ASSIGNEE && (
-                    <span className="text-xs text-gray-400">→{task.assignee}</span>
-                  )}
-                  {task.dueDate && (
-                    <span className={`text-xs flex items-center gap-0.5 ${!task.completed&&isOverdue(task.dueDate)?'text-red-500':'text-gray-400'}`}>
-                      <Calendar size={10}/>{fmtDate(task.dueDate)}{task.dueTime?' '+task.dueTime:''}
+                {td&&<div className="bg-red-500 text-white text-xs font-bold px-2 py-0.5 flex items-center gap-1"><span>🔥</span>今日締め切り</div>}
+                <div className="p-2.5 flex flex-col gap-1 flex-1 justify-between">
+                  <div className="flex items-start gap-1.5">
+                    <p className="text-xs font-semibold text-gray-800 flex-1 leading-tight line-clamp-2">{task.title}</p>
+                    {task.effort>0&&<span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 font-medium ${ec.color}`}>{ec.short}</span>}
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {task.assignee!==DEFAULT_ASSIGNEE&&<span className="text-xs text-gray-400">→{task.assignee}</span>}
+                    {task.dueDate&&<span className={`text-xs flex items-center gap-0.5 ${td?'text-red-500':isOverdue(task.dueDate)?'text-red-400':'text-gray-400'}`}><Calendar size={10}/>{fmtDate(task.dueDate)}{task.dueTime?' '+task.dueTime:''}</span>}
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className={`text-xs font-medium ${isMinLeaf?'text-green-600':isMaxLeaf?'text-red-500':'text-gray-400'}`}>
+                      {pathE>0?`パス ${pathE}`:''}{isMinLeaf?' ✓最軽':isMaxLeaf?' ⚠最重':''}
                     </span>
-                  )}
-                </div>
-
-                {/* 下段: パス労力 + ボタン */}
-                <div className="flex items-center justify-between mt-1">
-                  <span className={`text-xs font-medium ${isMinLeaf?'text-green-600':isMaxLeaf?'text-red-500':'text-gray-400'}`}>
-                    {pathE>0 ? `パス ${pathE}` : ''}
-                    {isMinLeaf ? ' ✓最軽' : isMaxLeaf ? ' ⚠最重' : ''}
-                  </span>
-                  <div className="flex gap-0.5">
-                    {task.parentId && (
-                      <button onPointerDown={e=>e.stopPropagation()} onClick={()=>onSetParent(task.id,null)}
-                        className="text-xs text-gray-300 hover:text-gray-600 px-1 rounded">↑外す</button>
-                    )}
-                    <button onPointerDown={e=>e.stopPropagation()} onClick={()=>onEdit(task)}
-                      className="text-xs text-gray-300 hover:text-navy px-1 rounded">編集</button>
+                    <div className="flex gap-0.5">
+                      {task.parentId&&<button onPointerDown={e=>e.stopPropagation()} onClick={()=>onSetParent(task.id,null)} className="text-xs text-gray-300 hover:text-gray-600 px-1">↑外す</button>}
+                      <button onPointerDown={e=>e.stopPropagation()} onClick={()=>onEdit(task)} className="text-xs text-gray-300 hover:text-navy px-1">編集</button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -676,34 +736,26 @@ const TreeView: React.FC<{
           })}
         </div>
       </div>
-
-      {/* パス一覧サマリー */}
-      {leaves.length>1 && leafEfforts.length>0 && (
+      {leaves.length>1&&leafEfforts.length>0&&(
         <div className="bg-white border border-gray-200 rounded-lg p-4">
           <h3 className="text-sm font-semibold text-gray-700 mb-2">パス労力サマリー（末端タスク）</h3>
           <div className="space-y-1.5">
-            {leaves
-              .filter(l=>(pathEffortMap.get(l.id)??0)>0)
-              .sort((a,b)=>(pathEffortMap.get(a.id)??0)-(pathEffortMap.get(b.id)??0))
-              .map(leaf=>{
-                const pe = pathEffortMap.get(leaf.id)??0
-                const isMin = pe===minE
-                const isMax = pe===maxE && minE!==maxE
-                const pct = maxE>0 ? Math.round((pe/maxE)*100) : 0
-                return (
-                  <div key={leaf.id} className="flex items-center gap-3">
-                    <span className={`text-xs w-2 h-2 rounded-full flex-shrink-0 ${isMin?'bg-green-400':isMax?'bg-red-400':'bg-gray-300'}`}/>
-                    <span className="text-xs text-gray-700 truncate flex-1">{leaf.title}</span>
-                    <div className="flex items-center gap-2 flex-shrink-0">
-                      <div className="w-24 bg-gray-100 rounded-full h-1.5">
-                        <div className={`h-1.5 rounded-full ${isMin?'bg-green-400':isMax?'bg-red-400':'bg-blue-300'}`} style={{width:`${pct}%`}}/>
-                      </div>
-                      <span className={`text-xs font-medium w-6 text-right ${isMin?'text-green-600':isMax?'text-red-500':'text-gray-500'}`}>{pe}</span>
+            {leaves.filter(l=>(pathEffortMap.get(l.id)??0)>0).sort((a,b)=>(pathEffortMap.get(a.id)??0)-(pathEffortMap.get(b.id)??0)).map(leaf=>{
+              const pe=pathEffortMap.get(leaf.id)??0
+              const isMin=pe===minE,isMax=pe===maxE&&minE!==maxE
+              return (
+                <div key={leaf.id} className="flex items-center gap-3">
+                  <span className={`text-xs w-2 h-2 rounded-full flex-shrink-0 ${isMin?'bg-green-400':isMax?'bg-red-400':'bg-gray-300'}`}/>
+                  <span className="text-xs text-gray-700 truncate flex-1">{leaf.title}</span>
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <div className="w-24 bg-gray-100 rounded-full h-1.5">
+                      <div className={`h-1.5 rounded-full ${isMin?'bg-green-400':isMax?'bg-red-400':'bg-blue-300'}`} style={{width:`${maxE>0?Math.round((pe/maxE)*100):0}%`}}/>
                     </div>
+                    <span className={`text-xs font-medium w-6 text-right ${isMin?'text-green-600':isMax?'text-red-500':'text-gray-500'}`}>{pe}</span>
                   </div>
-                )
-              })
-            }
+                </div>
+              )
+            })}
           </div>
         </div>
       )}
@@ -715,27 +767,6 @@ const TreeView: React.FC<{
 // TeachingsModal
 // ============================================================
 
-const TEACHINGS = [
-  {
-    num: '①',
-    title: '入口を減らす',
-    principle: '並行作業を減らすべし。',
-    example: '現在進行中のタスク数に厳格な上限を設け、それ以外の依頼は一旦別のストック場所に置く。',
-  },
-  {
-    num: '②',
-    title: '制約を先に固定する',
-    principle: '迷いを遮断すべし。',
-    example: '「今日はこの領域以外には手を出さない」といった制約を最初に設定し、判断の計算資源を節約する。',
-  },
-  {
-    num: '③',
-    title: '他者の頭脳を組み込む',
-    principle: '自分一人で完結させないべし。',
-    example: '6割程度の思考ができた段階で他者に共有し、前提のズレや抜け漏れを早い段階で指摘してもらう。',
-  },
-]
-
 const TeachingsModal: React.FC<{onClose:()=>void}> = ({onClose}) => (
   <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
     <div className="bg-white rounded-lg shadow-xl w-full max-w-md max-h-[85vh] overflow-y-auto">
@@ -744,18 +775,16 @@ const TeachingsModal: React.FC<{onClose:()=>void}> = ({onClose}) => (
         <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1"><X size={18}/></button>
       </div>
       <div className="px-6 py-5 space-y-5">
-        {TEACHINGS.map((t, i) => (
+        {TEACHINGS.map((t,i)=>(
           <React.Fragment key={t.num}>
-            {i > 0 && <hr className="border-gray-100"/>}
+            {i>0&&<hr className="border-gray-100"/>}
             <div className="space-y-2">
               <div className="flex items-center gap-2">
                 <span className="text-xs font-bold text-navy bg-navy/10 px-2 py-0.5 rounded-full">教え {t.num}</span>
                 <h3 className="font-semibold text-gray-800">{t.title}</h3>
               </div>
               <p className="text-sm font-medium text-gray-700">{t.principle}</p>
-              <p className="text-sm text-gray-500 leading-relaxed">
-                <span className="font-medium text-gray-600">具体例：</span>{t.example}
-              </p>
+              <p className="text-sm text-gray-500 leading-relaxed"><span className="font-medium text-gray-600">具体例：</span>{t.example}</p>
             </div>
           </React.Fragment>
         ))}
@@ -832,27 +861,38 @@ export default function App() {
     setShowModal(false); setEditTask(null)
   }
 
-  const handleComplete  = (id:string) => setTasks(prev=>prev.map(t=>t.id===id?{...t,completed:!t.completed}:t))
-  const handleToday     = (id:string) => {
+  // 完了チェック時に日時を記録
+  const handleComplete = (id:string) =>
+    setTasks(prev=>prev.map(t=>{
+      if(t.id!==id) return t
+      const nowCompleted = !t.completed
+      return {...t, completed:nowCompleted, completedAt: nowCompleted ? new Date().toISOString() : null}
+    }))
+
+  const handleToday = (id:string) => {
     const task=tasks.find(t=>t.id===id); if(!task) return
     if(!task.isToday&&todayActiveCount>=MAX_TODAY){setTodayWarn(true);return}
     setTasks(prev=>prev.map(t=>t.id===id?{...t,isToday:!t.isToday}:t))
   }
-  const handleEdit      = (task:Task) => { setEditTask(task); setShowModal(true) }
+
+  const handleEdit          = (task:Task) => { setEditTask(task); setShowModal(true) }
   const handleDeleteConfirm = () => { if(deleteId){setTasks(prev=>prev.filter(t=>t.id!==deleteId));setDeleteId(null)} }
-  const handleSetParent = (taskId:string, parentId:string|null) =>
+  const handleSetParent     = (taskId:string, parentId:string|null) =>
     setTasks(prev=>prev.map(t=>t.id===taskId?{...t,parentId}:t))
 
-  const cardProps = { onComplete:handleComplete, onToday:handleToday, onEdit:handleEdit, onDelete:(id:string)=>setDeleteId(id) }
+  const cardProps = {
+    onComplete:handleComplete, onToday:handleToday,
+    onEdit:handleEdit, onDelete:(id:string)=>setDeleteId(id),
+  }
 
   const dateLabel = new Date().toLocaleDateString('ja-JP',{year:'numeric',month:'long',day:'numeric',weekday:'short'})
 
   return (
     <div className="min-h-screen bg-gray-50 font-sans">
 
-      {/* Header */}
+      {/* ===== Header ===== */}
       <header className="bg-navy text-white px-6 py-4 shadow-sm">
-        <div className="max-w-4xl mx-auto flex items-center justify-between gap-3">
+        <div className="max-w-7xl mx-auto flex items-center justify-between gap-3">
           <div className="min-w-0">
             <h1 className="text-lg font-semibold tracking-wide">ノイマン式タスク管理</h1>
             <p className="text-xs text-blue-200 mt-0.5">{dateLabel}</p>
@@ -860,23 +900,27 @@ export default function App() {
           <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
             <button onClick={()=>setShowTeachings(true)}
               className="flex items-center gap-1.5 text-sm bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-md transition-colors">
-              <BookOpen size={14}/><span className="hidden sm:inline">ノイマンの教え</span>
+              <BookOpen size={14}/><span className="hidden md:inline">ノイマンの教え</span>
             </button>
             {/* ビュー切替 */}
             <div className="flex rounded-md overflow-hidden border border-white/20">
               {([
-                {mode:'list'  as ViewMode, icon:<List size={14}/>,       label:'リスト'},
-                {mode:'gantt' as ViewMode, icon:<BarChart2 size={14}/>,  label:'ガント'},
-                {mode:'tree'  as ViewMode, icon:<GitBranch size={14}/>,  label:'ツリー'},
+                {mode:'list'  as ViewMode, icon:<List size={14}/>,      label:'リスト'},
+                {mode:'gantt' as ViewMode, icon:<BarChart2 size={14}/>, label:'ガント'},
+                {mode:'tree'  as ViewMode, icon:<GitBranch size={14}/>, label:'ツリー'},
               ]).map(({mode,icon,label},i)=>(
                 <button key={mode} onClick={()=>setViewMode(mode)}
                   className={`flex items-center gap-1 px-2.5 py-1.5 text-sm transition-colors ${i>0?'border-l border-white/20':''} ${viewMode===mode?'bg-white/25':'hover:bg-white/10'}`}
-                  title={label}
-                >{icon}<span className="hidden sm:inline text-xs">{label}</span></button>
+                  title={label}>{icon}<span className="hidden sm:inline text-xs">{label}</span></button>
               ))}
             </div>
+            {/* エクスポート */}
+            <button onClick={()=>handleExportExcel(tasks)}
+              className="flex items-center gap-1.5 text-sm bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-md transition-colors" title="Excelエクスポート">
+              <FileSpreadsheet size={14}/><span className="hidden sm:inline">Excel</span>
+            </button>
             <button onClick={()=>handleExportCSV(tasks)}
-              className="flex items-center gap-1.5 text-sm bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-md transition-colors">
+              className="flex items-center gap-1.5 text-sm bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-md transition-colors" title="CSVエクスポート">
               <Download size={14}/><span className="hidden sm:inline">CSV</span>
             </button>
             <button onClick={()=>{setEditTask(null);setShowModal(true)}}
@@ -887,7 +931,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto px-4 py-6 space-y-6">
+      <main className="max-w-7xl mx-auto px-4 py-6 space-y-6">
 
         {/* ガントビュー */}
         {viewMode==='gantt' && (
@@ -900,10 +944,7 @@ export default function App() {
         {/* ツリービュー */}
         {viewMode==='tree' && (
           <section>
-            <div className="mb-4">
-              <h2 className="font-semibold text-gray-800">タスクツリー</h2>
-              <p className="text-xs text-gray-500 mt-0.5">親子関係・パス労力を可視化。ドラッグ&ドロップで依存関係を設定</p>
-            </div>
+            <div className="mb-4"><h2 className="font-semibold text-gray-800">タスクツリー</h2><p className="text-xs text-gray-500 mt-0.5">親子関係・パス労力を可視化。ドラッグ&ドロップで依存関係を設定</p></div>
             <TreeView tasks={tasks} onSetParent={handleSetParent} onEdit={handleEdit}/>
           </section>
         )}
@@ -911,22 +952,21 @@ export default function App() {
         {/* リストビュー */}
         {viewMode==='list' && (
           <>
-            {/* 今日の3つ */}
-            <section className="bg-gray-100 rounded-lg p-5">
+            {/* 今日の3つ — 適度な幅でまとまりを出す */}
+            <section className="bg-gray-100 rounded-lg p-5 max-w-2xl">
               <div className="flex items-start justify-between mb-4">
                 <div><h2 className="font-semibold text-gray-800">今日の3つ</h2><p className="text-xs text-gray-500 mt-0.5">今日やる最重要タスク（最大3つ）</p></div>
                 <span className={`text-sm font-medium px-2.5 py-1 rounded-full flex-shrink-0 ${todayActiveCount>=MAX_TODAY?'bg-red-100 text-red-600':'bg-navy/10 text-navy'}`}>
                   {todayActiveCount} / {MAX_TODAY}
                 </span>
               </div>
-              {todayTasks.length===0 ? (
-                <div className="text-center py-6 text-gray-400 text-sm">タスクカードの「今日」ボタンで追加できます</div>
-              ) : (
-                <div className="space-y-2">{todayTasks.map(t=><TaskCard key={t.id} task={t} {...cardProps}/>)}</div>
-              )}
+              {todayTasks.length===0
+                ? <div className="text-center py-6 text-gray-400 text-sm">タスクカードの「今日」ボタンで追加できます</div>
+                : <div className="space-y-2">{todayTasks.map(t=><TaskCard key={t.id} task={t} {...cardProps}/>)}</div>
+              }
             </section>
 
-            {/* 全タスク — 宛先別カラム */}
+            {/* 全タスク — 宛先別カラム・フル幅 */}
             <section>
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
                 <h2 className="font-semibold text-gray-800">全タスク</h2>
