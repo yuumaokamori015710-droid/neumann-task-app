@@ -3,6 +3,7 @@ import * as XLSX from 'xlsx'
 import {
   Plus, Pencil, Trash2, Check, Calendar, Download,
   AlertTriangle, X, BookOpen, List, BarChart2, GitBranch, Users, FileSpreadsheet,
+  History, RotateCcw, Star, StarOff,
 } from 'lucide-react'
 
 // ============================================================
@@ -38,7 +39,25 @@ interface Task {
   // Future: status, reviewDate, roughApprovalMode
 }
 
-interface AppData { tasks: Task[] }
+type HistoryAction =
+  | 'created' | 'updated' | 'deleted'
+  | 'completed' | 'uncompleted'
+  | 'todayAdded' | 'todayRemoved'
+  | 'parentChanged'
+
+interface HistoryEntry {
+  id: string
+  timestamp: string     // ISO
+  action: HistoryAction
+  taskId: string
+  taskTitle: string
+  detail?: string       // 補足情報
+}
+
+interface AppData {
+  tasks: Task[]
+  history: HistoryEntry[]
+}
 
 // ============================================================
 // Constants
@@ -46,6 +65,19 @@ interface AppData { tasks: Task[] }
 
 const STORAGE_KEY      = 'task-app-data'
 const MAX_TODAY        = 3
+const MAX_HISTORY      = 500   // 保持する履歴の最大件数
+
+// 操作種別ごとの表示設定
+const ACTION_CONFIG: Record<HistoryAction, { label: string; icon: React.ReactNode; color: string }> = {
+  created:       { label: '追加',         icon: <Plus size={13}/>,       color: 'text-green-600 bg-green-50' },
+  updated:       { label: '編集',         icon: <Pencil size={13}/>,     color: 'text-blue-600 bg-blue-50' },
+  deleted:       { label: '削除',         icon: <Trash2 size={13}/>,     color: 'text-red-600 bg-red-50' },
+  completed:     { label: '完了',         icon: <Check size={13}/>,      color: 'text-navy bg-navy/10' },
+  uncompleted:   { label: '完了解除',     icon: <RotateCcw size={13}/>,  color: 'text-gray-600 bg-gray-100' },
+  todayAdded:    { label: '今日に追加',   icon: <Star size={13}/>,       color: 'text-yellow-600 bg-yellow-50' },
+  todayRemoved:  { label: '今日から除外', icon: <StarOff size={13}/>,    color: 'text-gray-500 bg-gray-100' },
+  parentChanged: { label: '親タスク変更', icon: <GitBranch size={13}/>,  color: 'text-purple-600 bg-purple-50' },
+}
 const DAY_PX           = 28
 const DEFAULT_ASSIGNEE = '自分'
 
@@ -162,8 +194,9 @@ function buildTreeLayout(tasks: Task[]): Map<string, { x: number; y: number }> {
 const loadData = (): AppData => {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return { tasks: [] }
+    if (!raw) return { tasks: [], history: [] }
     const data = JSON.parse(raw) as AppData
+    data.history = data.history ?? []   // 後方互換
     data.tasks = (data.tasks ?? []).map(t => ({
       ...t,
       memo:        (t as Task).memo        ?? '',
@@ -174,7 +207,7 @@ const loadData = (): AppData => {
       completedAt: (t as Task).completedAt ?? null,
     }))
     return data
-  } catch { return { tasks: [] } }
+  } catch { return { tasks: [], history: [] } }
 }
 
 const saveData = (data: AppData) => localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
@@ -768,6 +801,107 @@ const TreeView: React.FC<{
 }
 
 // ============================================================
+// HistoryModal — 操作履歴
+// ============================================================
+
+const HistoryModal: React.FC<{ history: HistoryEntry[]; onClose: () => void; onClear: () => void }> = ({
+  history, onClose, onClear,
+}) => {
+  // 日付ごとにグループ化
+  const grouped = history.reduce<Record<string, HistoryEntry[]>>((acc, entry) => {
+    // ローカル日付キー
+    const d = new Date(entry.timestamp)
+    const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+    ;(acc[key] = acc[key] ?? []).push(entry)
+    return acc
+  }, {})
+
+  const dateKeys = Object.keys(grouped).sort().reverse()
+
+  const fmtDateKey = (key: string) => {
+    const today = todayStr()
+    const yd = new Date(); yd.setDate(yd.getDate()-1)
+    const yesterday = `${yd.getFullYear()}-${String(yd.getMonth()+1).padStart(2,'0')}-${String(yd.getDate()).padStart(2,'0')}`
+    if (key === today)     return '今日'
+    if (key === yesterday) return '昨日'
+    return new Date(key+'T00:00:00').toLocaleDateString('ja-JP', { month:'long', day:'numeric' })
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-lg max-h-[80vh] flex flex-col">
+
+        {/* ヘッダー */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100 flex-shrink-0">
+          <div className="flex items-center gap-2">
+            <History size={18} className="text-navy"/>
+            <h2 className="font-semibold text-gray-800">操作履歴</h2>
+            <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">{history.length}件</span>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1"><X size={18}/></button>
+        </div>
+
+        {/* 履歴リスト */}
+        <div className="overflow-y-auto flex-1 px-6 py-4">
+          {history.length === 0 ? (
+            <p className="text-center text-sm text-gray-400 py-12">操作履歴はまだありません</p>
+          ) : (
+            <div className="space-y-5">
+              {dateKeys.map(key => (
+                <div key={key}>
+                  <p className="text-xs font-bold text-gray-400 mb-2 sticky top-0 bg-white pb-1">
+                    {fmtDateKey(key)}
+                  </p>
+                  <div className="space-y-0.5">
+                    {grouped[key].map(entry => {
+                      const cfg = ACTION_CONFIG[entry.action]
+                      return (
+                        <div key={entry.id} className="flex items-start gap-3 py-2 border-b border-gray-50 last:border-0">
+                          {/* アイコン */}
+                          <span className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mt-0.5 ${cfg.color}`}>
+                            {cfg.icon}
+                          </span>
+                          {/* 内容 */}
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm text-gray-700 leading-snug">
+                              <span className="font-medium">{cfg.label}</span>
+                              <span className="text-gray-400 mx-1">—</span>
+                              <span className="text-gray-700">{entry.taskTitle}</span>
+                            </p>
+                            {entry.detail && (
+                              <p className="text-xs text-gray-400 mt-0.5">{entry.detail}</p>
+                            )}
+                          </div>
+                          {/* 時刻 */}
+                          <span className="text-xs text-gray-400 flex-shrink-0 mt-0.5">
+                            {new Date(entry.timestamp).toLocaleTimeString('ja-JP', { hour:'2-digit', minute:'2-digit' })}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* フッター */}
+        <div className="flex items-center justify-between px-6 py-4 border-t border-gray-100 flex-shrink-0">
+          <button onClick={()=>{ if(window.confirm('履歴をすべて削除しますか？')) onClear() }}
+            className="text-xs text-gray-400 hover:text-red-500 transition-colors">
+            履歴をクリア
+          </button>
+          <button onClick={onClose} className="px-4 py-2 text-sm bg-navy text-white rounded-md hover:bg-navy-dark">
+            閉じる
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
 // TeachingsModal
 // ============================================================
 
@@ -829,6 +963,7 @@ const Dialog: React.FC<DialogProps> = ({icon,iconColor,title,body,confirmLabel,c
 
 export default function App() {
   const [tasks,        setTasks]        = useState<Task[]>([])
+  const [history,      setHistory]      = useState<HistoryEntry[]>([])
   const [filter,       setFilter]       = useState<Filter>('all')
   const [viewMode,     setViewMode]     = useState<ViewMode>('list')
   const [showModal,    setShowModal]    = useState(false)
@@ -836,9 +971,19 @@ export default function App() {
   const [deleteId,     setDeleteId]     = useState<string|null>(null)
   const [todayWarn,    setTodayWarn]    = useState(false)
   const [showTeachings,setShowTeachings]= useState(false)
+  const [showHistory,  setShowHistory]  = useState(false)
 
-  useEffect(()=>{ const d=loadData(); setTasks(d.tasks) },[])
-  useEffect(()=>{ saveData({tasks}) },[tasks])
+  useEffect(()=>{ const d=loadData(); setTasks(d.tasks); setHistory(d.history) },[])
+  useEffect(()=>{ saveData({tasks, history}) },[tasks, history])
+
+  // 履歴エントリを先頭に追加（上限超えたら古いものを削除）
+  const addHistory = (action: HistoryAction, task: Task, detail?: string) => {
+    const entry: HistoryEntry = {
+      id: genId(), timestamp: new Date().toISOString(),
+      action, taskId: task.id, taskTitle: task.title, detail,
+    }
+    setHistory(prev => [entry, ...prev].slice(0, MAX_HISTORY))
+  }
 
   const knownAssignees = [DEFAULT_ASSIGNEE,
     ...Array.from(new Set(tasks.map(t=>t.assignee).filter((a):a is string=>!!a&&a!==DEFAULT_ASSIGNEE))).sort()
@@ -857,32 +1002,50 @@ export default function App() {
     }
   })
 
-  const handleSave = (task:Task) => {
-    setTasks(prev=>{
-      const idx=prev.findIndex(t=>t.id===task.id)
-      return idx>=0?prev.map(t=>t.id===task.id?task:t):[...prev,task]
+  const handleSave = (task: Task) => {
+    const isNew = !tasks.find(t => t.id === task.id)
+    setTasks(prev => {
+      const idx = prev.findIndex(t => t.id === task.id)
+      return idx >= 0 ? prev.map(t => t.id === task.id ? task : t) : [...prev, task]
     })
+    addHistory(isNew ? 'created' : 'updated', task)
     setShowModal(false); setEditTask(null)
   }
 
   // 完了チェック時に日時を記録
-  const handleComplete = (id:string) =>
-    setTasks(prev=>prev.map(t=>{
-      if(t.id!==id) return t
-      const nowCompleted = !t.completed
-      return {...t, completed:nowCompleted, completedAt: nowCompleted ? new Date().toISOString() : null}
+  const handleComplete = (id: string) => {
+    const task = tasks.find(t => t.id === id); if (!task) return
+    const nowCompleted = !task.completed
+    setTasks(prev => prev.map(t => t.id !== id ? t : {
+      ...t, completed: nowCompleted, completedAt: nowCompleted ? new Date().toISOString() : null,
     }))
-
-  const handleToday = (id:string) => {
-    const task=tasks.find(t=>t.id===id); if(!task) return
-    if(!task.isToday&&todayActiveCount>=MAX_TODAY){setTodayWarn(true);return}
-    setTasks(prev=>prev.map(t=>t.id===id?{...t,isToday:!t.isToday}:t))
+    addHistory(nowCompleted ? 'completed' : 'uncompleted', task)
   }
 
-  const handleEdit          = (task:Task) => { setEditTask(task); setShowModal(true) }
-  const handleDeleteConfirm = () => { if(deleteId){setTasks(prev=>prev.filter(t=>t.id!==deleteId));setDeleteId(null)} }
-  const handleSetParent     = (taskId:string, parentId:string|null) =>
-    setTasks(prev=>prev.map(t=>t.id===taskId?{...t,parentId}:t))
+  const handleToday = (id: string) => {
+    const task = tasks.find(t => t.id === id); if (!task) return
+    if (!task.isToday && todayActiveCount >= MAX_TODAY) { setTodayWarn(true); return }
+    const adding = !task.isToday
+    setTasks(prev => prev.map(t => t.id === id ? { ...t, isToday: adding } : t))
+    addHistory(adding ? 'todayAdded' : 'todayRemoved', task)
+  }
+
+  const handleEdit = (task: Task) => { setEditTask(task); setShowModal(true) }
+
+  const handleDeleteConfirm = () => {
+    if (!deleteId) return
+    const task = tasks.find(t => t.id === deleteId)
+    setTasks(prev => prev.filter(t => t.id !== deleteId))
+    if (task) addHistory('deleted', task)
+    setDeleteId(null)
+  }
+
+  const handleSetParent = (taskId: string, parentId: string | null) => {
+    const task   = tasks.find(t => t.id === taskId)
+    const parent = parentId ? tasks.find(t => t.id === parentId) : null
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, parentId } : t))
+    if (task) addHistory('parentChanged', task, parent ? `親: 「${parent.title}」` : 'ルートに変更')
+  }
 
   const cardProps = {
     onComplete:handleComplete, onToday:handleToday,
@@ -905,6 +1068,15 @@ export default function App() {
             <button onClick={()=>setShowTeachings(true)}
               className="flex items-center gap-1.5 text-sm bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-md transition-colors">
               <BookOpen size={14}/><span className="hidden md:inline">ノイマンの教え</span>
+            </button>
+            <button onClick={()=>setShowHistory(true)}
+              className="flex items-center gap-1.5 text-sm bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-md transition-colors" title="操作履歴">
+              <History size={14}/><span className="hidden md:inline">履歴</span>
+              {history.length > 0 && (
+                <span className="bg-white/30 text-white text-xs px-1.5 py-0.5 rounded-full leading-none">
+                  {history.length > 99 ? '99+' : history.length}
+                </span>
+              )}
             </button>
             {/* ビュー切替 */}
             <div className="flex rounded-md overflow-hidden border border-white/20">
@@ -1000,6 +1172,13 @@ export default function App() {
           onSave={handleSave} onClose={()=>{setShowModal(false);setEditTask(null)}}/>
       )}
       {showTeachings && <TeachingsModal onClose={()=>setShowTeachings(false)}/>}
+      {showHistory && (
+        <HistoryModal
+          history={history}
+          onClose={()=>setShowHistory(false)}
+          onClear={()=>setHistory([])}
+        />
+      )}
       {deleteId && (
         <Dialog icon={<AlertTriangle size={20}/>} iconColor="text-red-500"
           title="タスクを削除しますか？" body="この操作は元に戻せません。"
