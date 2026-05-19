@@ -78,7 +78,11 @@ const TEACHINGS = [
 // ============================================================
 
 const genId    = () => `${Date.now()}-${Math.random().toString(36).slice(2,9)}`
-const todayStr = () => new Date().toISOString().split('T')[0]
+// ローカル日付を使う（toISOStringはUTCなのでタイムゾーンのズレが生じる）
+const todayStr = () => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+}
 const isToday  = (d: string) => d === todayStr()
 
 const isThisWeek = (d: string): boolean => {
@@ -952,8 +956,8 @@ export default function App() {
         {/* リストビュー */}
         {viewMode==='list' && (
           <>
-            {/* 今日の3つ — 適度な幅でまとまりを出す */}
-            <section className="bg-gray-100 rounded-lg p-5 max-w-2xl">
+            {/* 今日の3つ — 中央寄せ */}
+            <section className="bg-gray-100 rounded-lg p-5 max-w-2xl mx-auto">
               <div className="flex items-start justify-between mb-4">
                 <div><h2 className="font-semibold text-gray-800">今日の3つ</h2><p className="text-xs text-gray-500 mt-0.5">今日やる最重要タスク（最大3つ）</p></div>
                 <span className={`text-sm font-medium px-2.5 py-1 rounded-full flex-shrink-0 ${todayActiveCount>=MAX_TODAY?'bg-red-100 text-red-600':'bg-navy/10 text-navy'}`}>
