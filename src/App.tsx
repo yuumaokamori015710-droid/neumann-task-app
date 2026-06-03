@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import * as XLSX from 'xlsx'
 import {
   Plus, Pencil, Trash2, Check, Calendar, Download,
-  AlertTriangle, X, BookOpen, List, BarChart2, GitBranch, Users, FileSpreadsheet,
+  AlertTriangle, X, BookOpen, Users, FileSpreadsheet, List, BarChart2,
   History, RotateCcw, Star, StarOff,
   Cloud, CloudOff, Eye, EyeOff,
 } from 'lucide-react'
@@ -13,13 +13,18 @@ import {
 
 type Priority    = 'high' | 'medium' | 'low'
 type Filter      = 'all' | 'today' | 'thisWeek' | 'overdue'
-type ViewMode    = 'list' | 'gantt' | 'tree'
-type EffortLevel = 0 | 1 | 2 | 3 | 5
+type ViewMode    = 'list' | 'gantt'
+type BoardGroupMode = 'assignee' | 'priority' | 'due'
+type DueGroup = 'overdue' | 'today' | 'thisWeek' | 'later' | 'noDate' | 'completed'
 
-interface CompletionCondition {
-  verb: string; verbCustom: string
-  target: string; targetCustom: string
-  state: string; stateCustom: string
+interface MiniStep {
+  id: string
+  text: string
+  done: boolean
+}
+
+interface Issue {
+  text: string
 }
 
 interface Task {
@@ -33,18 +38,16 @@ interface Task {
   completedAt: string | null  // 完了日時（ISO）
   isToday: boolean
   assignee: string
-  parentId: string | null
-  effort: EffortLevel
-  completionCondition: CompletionCondition
+  miniSteps: MiniStep[]
+  issue: Issue
   createdAt: string
-  // Future: status, reviewDate, roughApprovalMode
 }
 
 type HistoryAction =
   | 'created' | 'updated' | 'deleted'
   | 'completed' | 'uncompleted'
   | 'todayAdded' | 'todayRemoved'
-  | 'parentChanged'
+  | 'autoDeleted'
 
 interface HistoryEntry {
   id: string
@@ -77,7 +80,10 @@ const STORAGE_KEY      = 'task-app-data'
 const SETTINGS_KEY     = 'task-app-settings'
 const GIST_FILENAME    = 'neumann-task-app.json'
 const MAX_TODAY        = 3
-const MAX_HISTORY      = 500   // 保持する履歴の最大件数
+const HISTORY_RETENTION_DAYS = 7
+const COMPLETED_RETENTION_DAYS = 14
+const MIN_MINI_STEPS = 3
+const DAY_PX = 28
 
 // 操作種別ごとの表示設定
 const ACTION_CONFIG: Record<HistoryAction, { label: string; icon: React.ReactNode; color: string }> = {
@@ -88,27 +94,24 @@ const ACTION_CONFIG: Record<HistoryAction, { label: string; icon: React.ReactNod
   uncompleted:   { label: '完了解除',     icon: <RotateCcw size={13}/>,  color: 'text-gray-600 bg-gray-100' },
   todayAdded:    { label: '今日に追加',   icon: <Star size={13}/>,       color: 'text-yellow-600 bg-yellow-50' },
   todayRemoved:  { label: '今日から除外', icon: <StarOff size={13}/>,    color: 'text-gray-500 bg-gray-100' },
-  parentChanged: { label: '親タスク変更', icon: <GitBranch size={13}/>,  color: 'text-purple-600 bg-purple-50' },
+  autoDeleted:   { label: '棚卸削除',     icon: <Trash2 size={13}/>,     color: 'text-red-600 bg-red-50' },
 }
-const DAY_PX           = 28
 const DEFAULT_ASSIGNEE = '自分'
-
-const VERB_OPTIONS   = ['ドラフトが','要件が','合意が','レビューが','資料が','議事録が','質問への回答が','課題リストが','設計案が','テストが']
-const TARGET_OPTIONS = ['自分で','NRIから','上司と','業務部門と','チーム内で','関係者間で']
-const STATE_OPTIONS  = ['完成している','確定している','共有済みになっている','フィードバック反映済みになっている','承認されている','着手可能になっている']
 
 const PRIORITY_CONFIG: Record<Priority, { label: string; badge: string; bar: string; barDone: string }> = {
   high:   { label: '高', badge: 'bg-red-100 text-red-700',       bar: 'bg-red-300',    barDone: 'bg-red-200' },
   medium: { label: '中', badge: 'bg-yellow-100 text-yellow-700', bar: 'bg-yellow-300', barDone: 'bg-yellow-200' },
   low:    { label: '低', badge: 'bg-gray-100 text-gray-500',     bar: 'bg-gray-300',   barDone: 'bg-gray-200' },
 }
-
-const EFFORT_CONFIG: Record<number, { label: string; short: string; color: string }> = {
-  0: { label: '未設定',        short: '-',  color: 'bg-gray-100 text-gray-400' },
-  1: { label: 'S（〜1時間）',  short: 'S',  color: 'bg-green-100 text-green-600' },
-  2: { label: 'M（半日程度）', short: 'M',  color: 'bg-blue-100 text-blue-600' },
-  3: { label: 'L（1日程度）',  short: 'L',  color: 'bg-orange-100 text-orange-600' },
-  5: { label: 'XL（複数日）',  short: 'XL', color: 'bg-red-100 text-red-600' },
+const PRIORITY_ORDER: Priority[] = ['high', 'medium', 'low']
+const DUE_GROUPS: DueGroup[] = ['overdue', 'today', 'thisWeek', 'later', 'noDate', 'completed']
+const DUE_GROUP_LABELS: Record<DueGroup, string> = {
+  overdue: '期限切れ',
+  today: '今日',
+  thisWeek: '今週',
+  later: '今後',
+  noDate: '期限なし',
+  completed: '完了済み',
 }
 
 const TEACHINGS = [
@@ -147,56 +150,142 @@ const fmtDate = (d: string) =>
 const fmtDateTime = (iso: string) =>
   new Date(iso).toLocaleString('ja-JP',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
 
-const fmtCondition = (cc: CompletionCondition) => {
-  const v = cc.verb==='other' ? cc.verbCustom : cc.verb
-  const t = cc.target==='other' ? cc.targetCustom : cc.target
-  const s = cc.state==='other' ? cc.stateCustom : cc.state
-  return [v,t,s].filter(Boolean).join('')
+const addDaysStr = (days: number) => {
+  const d = new Date()
+  d.setDate(d.getDate() + days)
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
 }
 
-// Tree helpers
-function wouldCreateCycle(taskId: string, proposedParentId: string, tasks: Task[]): boolean {
-  const visited = new Set<string>()
-  let cur: string | null = proposedParentId
-  while (cur) {
-    if (cur === taskId) return true
-    if (visited.has(cur)) return false
-    visited.add(cur)
-    cur = tasks.find(t=>t.id===cur)?.parentId ?? null
+const endOfWeekStr = () => {
+  const d = new Date()
+  const dow = d.getDay()
+  d.setDate(d.getDate() + (dow === 0 ? 0 : 7 - dow))
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+}
+
+const getDueGroup = (task: Task): DueGroup => {
+  if (task.completed) return 'completed'
+  if (!task.dueDate) return 'noDate'
+  if (isOverdue(task.dueDate)) return 'overdue'
+  if (isToday(task.dueDate)) return 'today'
+  if (isThisWeek(task.dueDate)) return 'thisWeek'
+  return 'later'
+}
+
+const applyDueGroup = (task: Task, group: DueGroup): Task => {
+  if (group === 'completed') {
+    return { ...task, completed: true, completedAt: task.completedAt ?? new Date().toISOString() }
   }
-  return false
+  const dueDate =
+    group === 'overdue' ? addDaysStr(-1) :
+    group === 'today' ? todayStr() :
+    group === 'thisWeek' ? endOfWeekStr() :
+    group === 'later' ? addDaysStr(7) :
+    ''
+  return { ...task, completed: false, completedAt: null, dueDate }
 }
 
-function getPathEffort(taskId: string, tasks: Task[], visited = new Set<string>()): number {
-  if (visited.has(taskId)) return 0
-  visited.add(taskId)
-  const task = tasks.find(t=>t.id===taskId)
-  if (!task) return 0
-  const own = task.effort as number
-  if (!task.parentId) return own
-  return own + getPathEffort(task.parentId, tasks, visited)
-}
-
-const NODE_W = 200, NODE_H = 88, H_GAP = 28, V_GAP = 72
-
-function buildTreeLayout(tasks: Task[]): Map<string, { x: number; y: number }> {
-  const pos = new Map<string, { x: number; y: number }>()
-  let nextLeafX = 0
-  const layOut = (id: string, depth: number): number => {
-    const children = tasks.filter(t=>t.parentId===id)
-    if (children.length===0) {
-      pos.set(id, { x: nextLeafX, y: depth*(NODE_H+V_GAP) })
-      const cx = nextLeafX + NODE_W/2
-      nextLeafX += NODE_W + H_GAP
-      return cx
-    }
-    const cxs = children.map(c=>layOut(c.id, depth+1))
-    const center = (cxs[0] + cxs[cxs.length-1]) / 2
-    pos.set(id, { x: center - NODE_W/2, y: depth*(NODE_H+V_GAP) })
-    return center
+const extractFirstMatch = (text: string, patterns: RegExp[]) => {
+  for (const pattern of patterns) {
+    const match = text.match(pattern)
+    if (match?.[1]?.trim()) return match[1].trim()
   }
-  tasks.filter(t=>!t.parentId).forEach(r=>{layOut(r.id,0); nextLeafX+=H_GAP})
-  return pos
+  return ''
+}
+
+const inferCompletionCondition = (task: Pick<Task, 'title'|'memo'|'assignee'>) => {
+  const text = `${task.title}\n${task.memo}`.trim()
+  const who = task.assignee || DEFAULT_ASSIGNEE
+  const what = extractFirstMatch(text, [
+    /(?:何を|対象|成果物|内容)[:：]\s*([^\n]+)/i,
+    /(.+?)(?:を|について)(?:作成|共有|確認|連絡|送付|提出|完了|整理|レビュー|依頼)/,
+  ]) || task.title.trim()
+  const stage = extractFirstMatch(text, [
+    /(?:どの段階まで|段階|状態|完了条件)[:：]\s*([^\n]+)/i,
+    /(?:までに|まで)\s*([^\n]+)/,
+  ]) || '完了扱いにできる段階まで'
+  const action = extractFirstMatch(text, [
+    /(?:どうする|対応|アクション)[:：]\s*([^\n]+)/i,
+    /(作成|共有|確認|連絡|送付|提出|完了|整理|レビュー|依頼|更新|調整|回答)(?:する|して|$)/,
+  ]) || '進める'
+
+  return { who, what, stage, action }
+}
+
+const fmtCondition = (task: Pick<Task, 'title'|'memo'|'assignee'>) => {
+  const c = inferCompletionCondition(task)
+  return `${c.who}に、${c.what}を、${c.stage}、${c.action}`
+}
+
+const emptyMiniSteps = (): MiniStep[] =>
+  Array.from({ length: MIN_MINI_STEPS }, () => ({ id: genId(), text: '', done: false }))
+
+const normalizeMiniSteps = (steps: unknown): MiniStep[] => {
+  const list = Array.isArray(steps)
+    ? steps.map((s, i) => {
+        const step = s as Partial<MiniStep>
+        return {
+          id: step.id || `${genId()}-${i}`,
+          text: step.text ?? '',
+          done: !!step.done,
+        }
+      })
+    : []
+  while (list.length < MIN_MINI_STEPS) list.push({ id: genId(), text: '', done: false })
+  return list
+}
+
+const ISSUE_CRITERIA = [
+  '本質的な問題であること',
+  'よい仮説が出されていること',
+  '答えが出せること',
+]
+
+const emptyIssue = (): Issue => ({ text: '' })
+
+const normalizeIssue = (issue: unknown): Issue => {
+  const raw = (issue ?? {}) as Partial<Issue>
+  return {
+    text: raw.text ?? '',
+  }
+}
+
+const normalizeTask = (t: Partial<Task>): Task => ({
+  id: t.id ?? genId(),
+  title: t.title ?? '',
+  memo: t.memo ?? '',
+  dueDate: t.dueDate ?? '',
+  dueTime: t.dueTime ?? '',
+  priority: t.priority ?? 'medium',
+  completed: !!t.completed,
+  completedAt: t.completedAt ?? null,
+  isToday: !!t.isToday,
+  assignee: t.assignee ?? DEFAULT_ASSIGNEE,
+  miniSteps: normalizeMiniSteps((t as { miniSteps?: unknown }).miniSteps),
+  issue: normalizeIssue((t as { issue?: unknown }).issue),
+  createdAt: t.createdAt ?? new Date().toISOString(),
+})
+
+const getCurrentMiniStep = (task: Task) => {
+  const steps = normalizeMiniSteps(task.miniSteps).filter(s => s.text.trim())
+  if (!steps.length) return null
+  const idx = steps.findIndex(s => !s.done)
+  const currentIndex = idx >= 0 ? idx : steps.length - 1
+  return { step: steps[currentIndex], index: currentIndex + 1, total: steps.length, allDone: idx < 0 }
+}
+
+const sortTasksForWork = (items: Task[]) => [...items].sort((a, b) => {
+  if (a.completed !== b.completed) return a.completed ? 1 : -1
+  const aDue = a.dueDate || '9999-12-31'
+  const bDue = b.dueDate || '9999-12-31'
+  if (aDue !== bDue) return aDue.localeCompare(bDue)
+  return a.createdAt.localeCompare(b.createdAt)
+})
+
+const pruneHistory = (entries: HistoryEntry[]) => {
+  const cutoff = new Date()
+  cutoff.setDate(cutoff.getDate() - HISTORY_RETENTION_DAYS)
+  return entries.filter(entry => new Date(entry.timestamp) >= cutoff)
 }
 
 // ============================================================
@@ -210,15 +299,8 @@ const loadData = (): AppData => {
     const data = JSON.parse(raw) as AppData
     data.history     = data.history     ?? []   // 後方互換
     data.columnOrder = data.columnOrder ?? []   // 後方互換
-    data.tasks = (data.tasks ?? []).map(t => ({
-      ...t,
-      memo:        (t as Task).memo        ?? '',
-      assignee:    (t as Task).assignee    ?? DEFAULT_ASSIGNEE,
-      dueTime:     (t as Task).dueTime     ?? '',
-      parentId:    (t as Task).parentId    ?? null,
-      effort:      (t as Task).effort      ?? 0,
-      completedAt: (t as Task).completedAt ?? null,
-    }))
+    data.tasks = (data.tasks ?? []).map(t => normalizeTask(t))
+    data.history = pruneHistory(data.history)
     return data
   } catch { return { tasks: [], history: [], columnOrder: [] } }
 }
@@ -306,8 +388,13 @@ const toExportRow = (t: Task) => ({
   '完了':        t.completed ? '完了' : '未完了',
   '完了日時':    t.completedAt ? fmtDateTime(t.completedAt) : '',
   '今日の3つ':   t.isToday ? 'はい' : 'いいえ',
-  '労力':        EFFORT_CONFIG[t.effort]?.short ?? '-',
-  '完了条件':    fmtCondition(t.completionCondition),
+  '完了条件':    fmtCondition(t),
+  '現在ステップ': (() => {
+    const current = getCurrentMiniStep(t)
+    return current ? `${current.index}/${current.total} ${current.step.text}` : ''
+  })(),
+  'イシュー':    t.issue.text,
+  'イシュー観点': ISSUE_CRITERIA.join(' / '),
   '作成日':      t.createdAt.split('T')[0],
 })
 
@@ -328,7 +415,7 @@ const handleExportExcel = (tasks: Task[]) => {
   // 列幅設定
   ws['!cols'] = [
     {wch:32},{wch:12},{wch:40},{wch:8},{wch:12},{wch:8},
-    {wch:8},{wch:20},{wch:10},{wch:8},{wch:32},{wch:12},
+    {wch:8},{wch:20},{wch:10},{wch:48},{wch:32},{wch:40},{wch:24},{wch:12},
   ]
   // ヘッダー行のスタイル（背景色）
   const wb = XLSX.utils.book_new()
@@ -337,51 +424,24 @@ const handleExportExcel = (tasks: Task[]) => {
 }
 
 // ============================================================
-// ConditionSelect
-// ============================================================
-
-interface ConditionSelectProps {
-  label: string; options: string[]
-  value: string; customValue: string
-  onChange:(v:string)=>void; onCustomChange:(v:string)=>void
-}
-const ConditionSelect: React.FC<ConditionSelectProps> = ({label,options,value,customValue,onChange,onCustomChange}) => (
-  <div className="flex flex-col gap-1 flex-1 min-w-0">
-    <label className="text-xs text-gray-500">{label}</label>
-    <select value={value} onChange={e=>onChange(e.target.value)}
-      className="text-sm border border-gray-200 rounded-md px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-navy bg-white">
-      <option value="">未設定</option>
-      {options.map(o=><option key={o} value={o}>{o}</option>)}
-      <option value="other">その他（自由入力）</option>
-    </select>
-    {value==='other' && (
-      <input type="text" value={customValue} onChange={e=>onCustomChange(e.target.value)} placeholder="自由入力..."
-        className="text-sm border border-gray-200 rounded-md px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-navy"/>
-    )}
-  </div>
-)
-
-// ============================================================
 // TaskModal
 // ============================================================
 
-const emptyCC = (): CompletionCondition => ({verb:'',verbCustom:'',target:'',targetCustom:'',state:'',stateCustom:''})
 const makeNewTask = (): Task => ({
   id:genId(), title:'', memo:'', dueDate:'', dueTime:'', priority:'medium',
   completed:false, completedAt:null, isToday:false, assignee:DEFAULT_ASSIGNEE,
-  parentId:null, effort:0, completionCondition:emptyCC(),
+  miniSteps: emptyMiniSteps(), issue: emptyIssue(),
   createdAt: new Date().toISOString(),
 })
 
 interface TaskModalProps {
   initial: Task | null
-  allTasks: Task[]
   knownAssignees: string[]
   onSave: (t: Task) => void
   onClose: () => void
 }
 
-const TaskModal: React.FC<TaskModalProps> = ({ initial, allTasks, knownAssignees, onSave, onClose }) => {
+const TaskModal: React.FC<TaskModalProps> = ({ initial, knownAssignees, onSave, onClose }) => {
   const [form, setForm] = useState<Task>(initial ?? makeNewTask())
   const [assigneeMode, setAssigneeMode] = useState<'select'|'new'>(
     initial && !knownAssignees.includes(initial.assignee) ? 'new' : 'select'
@@ -390,13 +450,20 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, allTasks, knownAssignees
     initial && !knownAssignees.includes(initial.assignee) ? initial.assignee : ''
   )
 
-  const cc = form.completionCondition
-  const setCC = (f: keyof CompletionCondition, v: string) =>
-    setForm(p=>({...p, completionCondition:{...p.completionCondition,[f]:v}}))
-  const preview = fmtCondition(cc)
-
-  const availableParents = allTasks.filter(t => t.id!==form.id && !wouldCreateCycle(form.id, t.id, allTasks))
   const effectiveAssignee = assigneeMode==='new' ? (newAssigneeDraft.trim() || DEFAULT_ASSIGNEE) : form.assignee
+  const preview = fmtCondition({ ...form, assignee: effectiveAssignee })
+  const miniSteps = normalizeMiniSteps(form.miniSteps)
+  const setMiniStep = (id: string, patch: Partial<MiniStep>) =>
+    setForm(p => ({ ...p, miniSteps: normalizeMiniSteps(p.miniSteps).map(s => s.id === id ? { ...s, ...patch } : s) }))
+  const addMiniStep = () =>
+    setForm(p => ({ ...p, miniSteps: [...normalizeMiniSteps(p.miniSteps), { id: genId(), text: '', done: false }] }))
+  const removeMiniStep = (id: string) =>
+    setForm(p => {
+      const next = normalizeMiniSteps(p.miniSteps).filter(s => s.id !== id)
+      return { ...p, miniSteps: normalizeMiniSteps(next) }
+    })
+  const setIssue = (patch: Partial<Issue>) =>
+    setForm(p => ({ ...p, issue: { ...normalizeIssue(p.issue), ...patch } }))
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
@@ -414,16 +481,6 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, allTasks, knownAssignees
               onChange={e=>setForm(p=>({...p,title:e.target.value}))}
               placeholder="タスク名を入力..."
               className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy"/>
-          </div>
-
-          {/* メモ */}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1.5">メモ</label>
-            <textarea value={form.memo}
-              onChange={e=>setForm(p=>({...p,memo:e.target.value}))}
-              placeholder="補足・背景・リンクなど自由記述..."
-              rows={3}
-              className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy resize-y"/>
           </div>
 
           {/* 宛先 */}
@@ -471,45 +528,80 @@ const TaskModal: React.FC<TaskModalProps> = ({ initial, allTasks, knownAssignees
             </div>
           </div>
 
-          {/* 親タスク・労力 */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1.5">親タスク</label>
-              <select value={form.parentId??''}
-                onChange={e=>setForm(p=>({...p,parentId:e.target.value||null}))}
-                className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy bg-white">
-                <option value="">なし（ルート）</option>
-                {availableParents.map(t=><option key={t.id} value={t.id}>{t.title}</option>)}
-              </select>
+          {/* ミニステップ */}
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-sm font-medium text-gray-700">ミニステップ</label>
+              <button type="button" onClick={addMiniStep}
+                className="flex items-center gap-1 text-xs text-navy hover:text-navy-dark">
+                <Plus size={13}/>ステップ追加
+              </button>
             </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1.5">労力</label>
-              <select value={form.effort} onChange={e=>setForm(p=>({...p,effort:Number(e.target.value) as EffortLevel}))}
-                className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy bg-white">
-                {[0,1,2,3,5].map(v=><option key={v} value={v}>{EFFORT_CONFIG[v].label}</option>)}
-              </select>
+            <div className="space-y-2">
+              {miniSteps.map((step, i) => (
+                <div key={step.id} className="flex items-center gap-2">
+                  <button type="button" onClick={()=>setMiniStep(step.id, { done: !step.done })}
+                    className={`w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 transition-colors ${
+                      step.done ? 'bg-navy border-navy' : 'border-gray-300 hover:border-navy'
+                    }`}>
+                    {step.done && <Check size={11} className="text-white"/>}
+                  </button>
+                  <span className="text-xs text-gray-400 w-8 flex-shrink-0">#{i + 1}</span>
+                  <input type="text" value={step.text}
+                    onChange={e=>setMiniStep(step.id, { text: e.target.value })}
+                    placeholder={`ステップ${i + 1}`}
+                    className="flex-1 min-w-0 border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy"/>
+                  {miniSteps.length > MIN_MINI_STEPS && (
+                    <button type="button" onClick={()=>removeMiniStep(step.id)}
+                      className="p-1 text-gray-300 hover:text-red-500">
+                      <Trash2 size={14}/>
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* メモ */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">メモ</label>
+            <textarea value={form.memo}
+              onChange={e=>setForm(p=>({...p,memo:e.target.value}))}
+              placeholder="補足・背景・リンクなど自由記述..."
+              rows={8}
+              className="w-full min-h-48 border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy resize-y"/>
+          </div>
+
+          {/* イシュー */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">イシュー</label>
+            <textarea value={form.issue.text}
+              onChange={e=>setIssue({ text: e.target.value })}
+              placeholder="このタスクで答えを出したい本質的な問い..."
+              rows={3}
+              className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy resize-y"/>
+            <div className="mt-2 grid gap-2 sm:grid-cols-3">
+              {ISSUE_CRITERIA.map((label, i) => (
+                <div key={label} className="flex items-start gap-2 text-xs text-gray-600 bg-gray-50 rounded px-2 py-2">
+                  <span className="font-semibold text-navy flex-shrink-0">{i + 1}</span>
+                  <span>{label}</span>
+                </div>
+              ))}
             </div>
           </div>
 
           {/* 完了条件 */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">完了条件</label>
-            <div className="flex gap-2">
-              <ConditionSelect label="動詞" options={VERB_OPTIONS} value={cc.verb} customValue={cc.verbCustom} onChange={v=>setCC('verb',v)} onCustomChange={v=>setCC('verbCustom',v)}/>
-              <ConditionSelect label="対象" options={TARGET_OPTIONS} value={cc.target} customValue={cc.targetCustom} onChange={v=>setCC('target',v)} onCustomChange={v=>setCC('targetCustom',v)}/>
-              <ConditionSelect label="状態" options={STATE_OPTIONS} value={cc.state} customValue={cc.stateCustom} onChange={v=>setCC('state',v)} onCustomChange={v=>setCC('stateCustom',v)}/>
-            </div>
-            {preview && (
-              <p className="mt-2 text-xs bg-gray-50 text-gray-600 rounded px-3 py-2">
-                完了条件: <span className="font-medium text-gray-800">{preview}</span>
-              </p>
-            )}
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">完了条件（自動）</label>
+            <p className="text-xs bg-gray-50 text-gray-600 rounded px-3 py-2 leading-relaxed">
+              {preview}
+            </p>
           </div>
         </div>
 
         <div className="flex justify-end gap-2 px-6 py-4 border-t border-gray-100">
           <button onClick={onClose} className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700">キャンセル</button>
-          <button onClick={()=>form.title.trim()&&onSave({...form,assignee:effectiveAssignee})}
+          <button onClick={()=>form.title.trim()&&onSave(normalizeTask({...form,assignee:effectiveAssignee}))}
             disabled={!form.title.trim()}
             className="px-4 py-2 text-sm bg-navy text-white rounded-md hover:bg-navy-dark disabled:opacity-40 disabled:cursor-not-allowed">
             {initial?'保存':'追加'}
@@ -533,10 +625,10 @@ interface TaskCardProps {
 
 const TaskCard: React.FC<TaskCardProps> = ({task,onComplete,onToday,onEdit,onDelete,hideAssignee=false}) => {
   const pc         = PRIORITY_CONFIG[task.priority]
-  const ec         = EFFORT_CONFIG[task.effort]
-  const cond       = fmtCondition(task.completionCondition)
+  const cond       = fmtCondition(task)
   const overdue    = !task.completed && isOverdue(task.dueDate)
   const todayDue   = !task.completed && !!task.dueDate && isToday(task.dueDate)
+  const currentStep = getCurrentMiniStep(task)
 
   return (
     <div className={[
@@ -570,12 +662,28 @@ const TaskCard: React.FC<TaskCardProps> = ({task,onComplete,onToday,onEdit,onDel
                 {task.title}
               </span>
               <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${pc.badge}`}>{pc.label}</span>
-              {task.effort>0 && <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${ec.color}`}>{ec.short}</span>}
               {!hideAssignee && task.assignee!==DEFAULT_ASSIGNEE && (
                 <span className="text-xs px-1.5 py-0.5 rounded bg-navy/10 text-navy flex-shrink-0">→ {task.assignee}</span>
               )}
             </div>
-            {cond && <p className="text-xs text-gray-400 mt-0.5 truncate">完了条件: {cond}</p>}
+            <p className="text-xs text-gray-400 mt-0.5 truncate">完了条件: {cond}</p>
+            {currentStep && (
+              <div className={`mt-2 rounded px-3 py-2 text-xs leading-relaxed ${
+                currentStep.allDone ? 'bg-green-50 text-green-700' : 'bg-blue-50 text-blue-700'
+              }`}>
+                <span className="font-semibold">Step {currentStep.index}/{currentStep.total}</span>
+                <span className="mx-1">—</span>
+                <span>{currentStep.allDone ? '全ステップ完了' : currentStep.step.text}</span>
+              </div>
+            )}
+            {task.issue.text && (
+              <div className="mt-2 text-xs bg-amber-50 text-amber-800 rounded px-3 py-2 leading-relaxed">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold flex-shrink-0">Issue</span>
+                  <span className="truncate flex-1">{task.issue.text}</span>
+                </div>
+              </div>
+            )}
             {task.dueDate && (
               <div className={`flex items-center gap-1 mt-1 text-xs font-medium ${
                 todayDue ? 'text-red-600' : overdue ? 'text-red-500' : 'text-gray-400'
@@ -619,6 +727,7 @@ const COL_W = 360  // 列幅 (px)
 
 interface AssigneeColsProps {
   tasks: Task[]
+  groupMode: BoardGroupMode
   knownAssignees: string[]
   columnOrder: string[]
   onReorderTasks: (tasks: Task[]) => void
@@ -628,7 +737,7 @@ interface AssigneeColsProps {
 }
 
 const AssigneeCols: React.FC<AssigneeColsProps> = ({
-  tasks, knownAssignees, columnOrder,
+  tasks, groupMode, knownAssignees, columnOrder,
   onReorderTasks, onReorderColumns,
   onComplete, onToday, onEdit, onDelete,
 }) => {
@@ -643,9 +752,25 @@ const AssigneeCols: React.FC<AssigneeColsProps> = ({
     ...columnOrder.filter(a => knownAssignees.includes(a)),
     ...knownAssignees.filter(a => !columnOrder.includes(a)),
   ]
-  const cols = orderedAssignees
-    .map(a => ({ assignee: a, tasks: tasks.filter(t => t.assignee === a) }))
+  const orderedGroups = groupMode === 'priority' ? PRIORITY_ORDER : groupMode === 'due' ? DUE_GROUPS : orderedAssignees
+  const orderIndex = new Map(orderedGroups.map((a, i) => [a, i]))
+  const cols = orderedGroups
+    .map(group => ({
+      key: group,
+      label: groupMode === 'priority' ? PRIORITY_CONFIG[group as Priority].label : groupMode === 'due' ? DUE_GROUP_LABELS[group as DueGroup] : group,
+      tasks: sortTasksForWork(tasks.filter(t =>
+        groupMode === 'priority' ? t.priority === group :
+        groupMode === 'due' ? getDueGroup(t) === group :
+        t.assignee === group
+      )),
+    }))
     .filter(c => c.tasks.length > 0)
+    .sort((a, b) => {
+      if (groupMode !== 'assignee') return (orderIndex.get(a.key) ?? 0) - (orderIndex.get(b.key) ?? 0)
+      const activeDiff = b.tasks.filter(t => !t.completed).length - a.tasks.filter(t => !t.completed).length
+      if (activeDiff !== 0) return activeDiff
+      return (orderIndex.get(a.key) ?? 0) - (orderIndex.get(b.key) ?? 0)
+    })
 
   const clear = () => {
     setDragTaskId(null); setDragColName(null)
@@ -653,9 +778,14 @@ const AssigneeCols: React.FC<AssigneeColsProps> = ({
   }
 
   // タスクをカード上にドロップ
-  const dropOnTask = (targetId: string, targetAssignee: string) => {
+  const dropOnTask = (targetId: string, targetGroup: string) => {
     if (!dragTaskId || dragTaskId === targetId) { clear(); return }
-    const dragged = { ...tasks.find(t => t.id === dragTaskId)!, assignee: targetAssignee }
+    const base = tasks.find(t => t.id === dragTaskId)!
+    const dragged = groupMode === 'priority'
+      ? { ...base, priority: targetGroup as Priority }
+      : groupMode === 'due'
+        ? applyDueGroup(base, targetGroup as DueGroup)
+      : { ...base, assignee: targetGroup }
     const rest    = tasks.filter(t => t.id !== dragTaskId)
     let idx = rest.findIndex(t => t.id === targetId)
     if (dropPos === 'after') idx++
@@ -665,19 +795,25 @@ const AssigneeCols: React.FC<AssigneeColsProps> = ({
   }
 
   // タスクを列の空白にドロップ（列の末尾へ）
-  const dropOnCol = (targetAssignee: string) => {
+  const dropOnCol = (targetGroup: string) => {
     if (!dragTaskId) { clear(); return }
-    const dragged = { ...tasks.find(t => t.id === dragTaskId)!, assignee: targetAssignee }
+    const base = tasks.find(t => t.id === dragTaskId)!
+    const dragged = groupMode === 'priority'
+      ? { ...base, priority: targetGroup as Priority }
+      : groupMode === 'due'
+        ? applyDueGroup(base, targetGroup as DueGroup)
+      : { ...base, assignee: targetGroup }
     onReorderTasks([...tasks.filter(t => t.id !== dragTaskId), dragged])
     clear()
   }
 
   // 列ヘッダーへドロップ（列の並び替え）
-  const dropOnColHeader = (targetAssignee: string) => {
-    if (!dragColName || dragColName === targetAssignee) { clear(); return }
+  const dropOnColHeader = (targetGroup: string) => {
+    if (groupMode !== 'assignee') { clear(); return }
+    if (!dragColName || dragColName === targetGroup) { clear(); return }
     const newOrder = [...orderedAssignees]
     newOrder.splice(newOrder.indexOf(dragColName), 1)
-    newOrder.splice(newOrder.indexOf(targetAssignee), 0, dragColName)
+    newOrder.splice(newOrder.indexOf(targetGroup), 0, dragColName)
     onReorderColumns(newOrder)
     clear()
   }
@@ -689,38 +825,41 @@ const AssigneeCols: React.FC<AssigneeColsProps> = ({
   return (
     <div className="overflow-x-auto pb-4">
       <div className="flex gap-4" style={{ minWidth: 'max-content' }}>
-        {cols.map(({ assignee, tasks: colTasks }) => {
+        {cols.map(({ key, label, tasks: colTasks }) => {
           const active       = colTasks.filter(t => !t.completed).length
-          const isSelf       = assignee === DEFAULT_ASSIGNEE
-          const isColTarget  = dropColName === assignee && !!dragColName && dragColName !== assignee
-          const isDraggingCol = dragColName === assignee
+          const isSelf       = groupMode === 'assignee' && key === DEFAULT_ASSIGNEE
+          const isPriority   = groupMode === 'priority'
+          const isDue        = groupMode === 'due'
+          const isColTarget  = dropColName === key && !!dragColName && dragColName !== key
+          const isDraggingCol = dragColName === key
 
           return (
             <div
-              key={assignee}
+              key={key}
               style={{ width: COL_W }}
               className={`flex-shrink-0 transition-opacity ${isDraggingCol ? 'opacity-30' : ''}`}
-              onDragOver={e => { e.preventDefault(); if (dragTaskId) setDropColName(assignee) }}
-              onDrop={() => { if (dragTaskId) dropOnCol(assignee) }}
+              onDragOver={e => { e.preventDefault(); if (dragTaskId) setDropColName(key) }}
+              onDrop={() => { if (dragTaskId) dropOnCol(key) }}
             >
               {/* 列ヘッダー（ドラッグで列並び替え） */}
               <div
-                draggable
-                onDragStart={e => { e.stopPropagation(); setDragColName(assignee); setDragTaskId(null) }}
+                draggable={groupMode === 'assignee'}
+                onDragStart={e => { e.stopPropagation(); setDragColName(key); setDragTaskId(null) }}
                 onDragEnd={clear}
-                onDragOver={e => { e.preventDefault(); e.stopPropagation(); setDropColName(assignee) }}
-                onDrop={e => { e.stopPropagation(); dropOnColHeader(assignee) }}
+                onDragOver={e => { e.preventDefault(); e.stopPropagation(); setDropColName(key) }}
+                onDrop={e => { e.stopPropagation(); dropOnColHeader(key) }}
                 className={[
-                  'flex items-center justify-between px-3 py-2.5 rounded-lg mb-2 cursor-grab select-none transition-all',
-                  isSelf ? 'bg-navy/10' : 'bg-amber-50 border border-amber-200',
+                  'flex items-center justify-between px-3 py-2.5 rounded-lg mb-2 select-none transition-all',
+                  groupMode === 'assignee' ? 'cursor-grab' : '',
+                  isPriority ? PRIORITY_CONFIG[key as Priority].badge : isDue ? 'bg-sky-50 border border-sky-200 text-sky-700' : isSelf ? 'bg-navy/10' : 'bg-amber-50 border border-amber-200',
                   isColTarget ? 'ring-2 ring-navy shadow-md' : '',
                 ].join(' ')}
               >
                 <div className="flex items-center gap-2">
-                  <span className="text-gray-300 text-base leading-none">⠿</span>
-                  <Users size={13} className={isSelf ? 'text-navy' : 'text-amber-600'} />
-                  <span className={`text-sm font-semibold ${isSelf ? 'text-navy' : 'text-amber-700'}`}>
-                    {assignee}
+                  {groupMode === 'assignee' && <span className="text-gray-300 text-base leading-none">⠿</span>}
+                  {isPriority ? <BarChart2 size={13}/> : isDue ? <Calendar size={13}/> : <Users size={13} className={isSelf ? 'text-navy' : 'text-amber-600'} />}
+                  <span className={`text-sm font-semibold ${isPriority || isDue ? '' : isSelf ? 'text-navy' : 'text-amber-700'}`}>
+                    {isPriority ? `優先度 ${label}` : label}
                   </span>
                 </div>
                 <span className="text-xs text-gray-500 bg-white px-1.5 py-0.5 rounded-full">
@@ -752,10 +891,10 @@ const AssigneeCols: React.FC<AssigneeColsProps> = ({
                           const r = e.currentTarget.getBoundingClientRect()
                           setDropPos(e.clientY < r.top + r.height / 2 ? 'before' : 'after')
                         }}
-                        onDrop={e => { e.stopPropagation(); dropOnTask(task.id, assignee) }}
+                        onDrop={e => { e.stopPropagation(); dropOnTask(task.id, key) }}
                         className={`transition-opacity cursor-grab ${isDragging ? 'opacity-25' : ''}`}
                       >
-                        <TaskCard task={task} hideAssignee
+                        <TaskCard task={task} hideAssignee={groupMode === 'assignee'}
                           onComplete={onComplete} onToday={onToday}
                           onEdit={onEdit} onDelete={onDelete} />
                       </div>
@@ -782,9 +921,12 @@ const AssigneeCols: React.FC<AssigneeColsProps> = ({
 
 const GanttChart: React.FC<{tasks:Task[]}> = ({tasks}) => {
   const scrollRef = useRef<HTMLDivElement>(null)
-  const withDates = tasks.filter(t=>t.dueDate)
+  const withDates = sortTasksForWork(tasks.filter(t=>t.dueDate))
   const today = new Date(); today.setHours(0,0,0,0)
-  const allMs = withDates.flatMap(t=>[new Date(t.createdAt.split('T')[0]+'T00:00:00').getTime(),new Date(t.dueDate+'T00:00:00').getTime()])
+  const allMs = withDates.flatMap(t=>[
+    new Date(t.createdAt.split('T')[0]+'T00:00:00').getTime(),
+    new Date(t.dueDate+'T00:00:00').getTime(),
+  ])
   const rawMin = allMs.length?Math.min(...allMs):today.getTime()
   const rawMax = allMs.length?Math.max(...allMs):today.getTime()
   const winStart = new Date(Math.min(rawMin,today.getTime()-14*86400000))
@@ -799,19 +941,23 @@ const GanttChart: React.FC<{tasks:Task[]}> = ({tasks}) => {
   while(cur.getTime()<=winEnd.getTime()+7*86400000){weeks.push(new Date(cur));cur.setDate(cur.getDate()+7)}
   useEffect(()=>{if(scrollRef.current)scrollRef.current.scrollLeft=Math.max(0,todayX-120)},[todayX])
   if(!withDates.length) return <div className="bg-white border border-gray-200 rounded-lg py-12 text-center text-gray-400 text-sm">期限日が設定されたタスクがありません</div>
-  const ROW_H = 44
+  const ROW_H = 52
   return (
     <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
       <div className="flex">
-        <div className="w-48 flex-shrink-0 border-r border-gray-100 bg-white">
+        <div className="w-64 flex-shrink-0 border-r border-gray-100 bg-white">
           <div className="h-9 bg-gray-50 border-b border-gray-200"/>
           {withDates.map(task=>{
             const td = !task.completed&&!!task.dueDate&&isToday(task.dueDate)
+            const current = getCurrentMiniStep(task)
             return (
-              <div key={task.id} className={`flex items-center gap-1.5 px-3 border-b border-gray-100 ${task.completed?'opacity-40':''} ${td?'bg-red-50':''}`} style={{height:ROW_H}}>
-                {task.isToday&&<span className="w-1.5 h-1.5 rounded-full bg-navy flex-shrink-0"/>}
-                {td&&<span className="text-red-500 flex-shrink-0">🔥</span>}
-                <span className={`text-xs truncate ${td?'text-red-700 font-semibold':'text-gray-700'}`}>{task.title}</span>
+              <div key={task.id} className={`px-3 border-b border-gray-100 flex flex-col justify-center ${task.completed?'opacity-40':''} ${td?'bg-red-50':''}`} style={{height:ROW_H}}>
+                <div className="flex items-center gap-1.5 min-w-0">
+                  {task.isToday&&<span className="w-1.5 h-1.5 rounded-full bg-navy flex-shrink-0"/>}
+                  {td&&<span className="text-red-500 flex-shrink-0">!</span>}
+                  <span className={`text-xs truncate ${td?'text-red-700 font-semibold':'text-gray-700'}`}>{task.title}</span>
+                </div>
+                {current && <span className="text-[11px] text-gray-400 truncate">Step {current.index}/{current.total}: {current.step.text}</span>}
               </div>
             )
           })}
@@ -839,12 +985,12 @@ const GanttChart: React.FC<{tasks:Task[]}> = ({tasks}) => {
                 const td=!task.completed&&isToday(task.dueDate)
                 return (
                   <div key={task.id} className={`relative border-b border-gray-100 ${td?'bg-red-50':''}`} style={{height:ROW_H}}>
-                    <div className={`absolute h-6 top-[10px] rounded flex items-center ${task.completed?pc.barDone+' opacity-50':td?'bg-red-500':pc.bar}`}
+                    <div className={`absolute h-6 top-[13px] rounded flex items-center ${task.completed?pc.barDone+' opacity-50':td?'bg-red-500':pc.bar}`}
                       style={{left:x,width:barW}} title={`${task.title}`}>
                       {task.completed&&<Check size={11} className="ml-1.5 text-gray-600 flex-shrink-0"/>}
                     </div>
-                    {overdue&&!td&&<div className="absolute w-1.5 h-6 top-[10px] bg-red-600 rounded-r opacity-70 z-10" style={{left:endX-6}}/>}
-                    <span className={`absolute text-xs top-[12px] whitespace-nowrap ${td?'text-red-600 font-medium':overdue?'text-red-500':'text-gray-400'}`} style={{left:endX+4}}>
+                    {overdue&&!td&&<div className="absolute w-1.5 h-6 top-[13px] bg-red-600 rounded-r opacity-70 z-10" style={{left:endX-6}}/>}
+                    <span className={`absolute text-xs top-[15px] whitespace-nowrap ${td?'text-red-600 font-medium':overdue?'text-red-500':'text-gray-400'}`} style={{left:endX+4}}>
                       {fmtDate(task.dueDate)}{task.dueTime?' '+task.dueTime:''}
                     </span>
                   </div>
@@ -857,136 +1003,8 @@ const GanttChart: React.FC<{tasks:Task[]}> = ({tasks}) => {
       <div className="flex items-center gap-4 px-4 py-2.5 border-t border-gray-100 bg-gray-50 text-xs text-gray-400">
         <div className="flex items-center gap-1.5"><div className="w-0.5 h-4 bg-red-400 opacity-75"/><span>今日</span></div>
         <div className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-navy"/><span>今日の3つ</span></div>
-        <div className="flex items-center gap-1.5"><span>🔥</span><span>今日締め切り</span></div>
+        <div className="flex items-center gap-1.5"><span className="text-red-500">!</span><span>今日締め切り</span></div>
       </div>
-    </div>
-  )
-}
-
-// ============================================================
-// TreeView
-// ============================================================
-
-const TreeView: React.FC<{
-  tasks:Task[]
-  onSetParent:(taskId:string,parentId:string|null)=>void
-  onEdit:(t:Task)=>void
-}> = ({tasks,onSetParent,onEdit}) => {
-  const [draggingId,   setDraggingId]  = useState<string|null>(null)
-  const [dropTargetId, setDropTargetId]= useState<string|null>(null)
-
-  const positions = buildTreeLayout(tasks)
-  let maxX=0,maxY=0
-  for(const [,p] of positions){maxX=Math.max(maxX,p.x+NODE_W);maxY=Math.max(maxY,p.y+NODE_H)}
-  const canvasW = maxX+H_GAP*2, canvasH = maxY+V_GAP
-
-  const pathEffortMap = new Map(tasks.map(t=>[t.id,getPathEffort(t.id,tasks)]))
-  const leaves = tasks.filter(t=>!tasks.some(o=>o.parentId===t.id))
-  const leafEfforts = leaves.map(l=>pathEffortMap.get(l.id)??0).filter(e=>e>0)
-  const minE = leafEfforts.length?Math.min(...leafEfforts):-1
-  const maxE = leafEfforts.length?Math.max(...leafEfforts):-1
-
-  const handleDrop = (targetId:string|null) => {
-    if(!draggingId) return
-    if(targetId===draggingId){setDraggingId(null);setDropTargetId(null);return}
-    if(targetId&&wouldCreateCycle(draggingId,targetId,tasks)){setDraggingId(null);setDropTargetId(null);return}
-    onSetParent(draggingId,targetId)
-    setDraggingId(null);setDropTargetId(null)
-  }
-
-  if(!tasks.length) return <div className="text-center py-12 text-gray-400 text-sm">タスクを追加してください</div>
-
-  return (
-    <div className="space-y-3">
-      <div className="flex items-center gap-4 text-xs text-gray-500 flex-wrap">
-        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm bg-green-100 border border-green-400 inline-block"/>最軽パス</span>
-        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm bg-red-100 border border-red-300 inline-block"/>最重パス</span>
-        <span className="text-gray-400">ドラッグ→別タスクにドロップで親子関係設定 / 空白ドロップでルートに戻す</span>
-      </div>
-      <div className="border border-gray-200 rounded-lg bg-gray-50 overflow-auto"
-        onDragOver={e=>e.preventDefault()} onDrop={()=>handleDrop(null)}
-        style={{minHeight:Math.max(canvasH+32,200)}}>
-        <div className="relative m-4" style={{width:canvasW,height:canvasH}}>
-          <svg className="absolute inset-0 pointer-events-none" width={canvasW} height={canvasH}>
-            {tasks.filter(t=>t.parentId).map(task=>{
-              const cp=positions.get(task.id),pp=positions.get(task.parentId!)
-              if(!cp||!pp) return null
-              const x1=pp.x+NODE_W/2,y1=pp.y+NODE_H,x2=cp.x+NODE_W/2,y2=cp.y,my=(y1+y2)/2
-              return <path key={task.id} d={`M${x1} ${y1} C${x1} ${my},${x2} ${my},${x2} ${y2}`} fill="none" stroke="#cbd5e1" strokeWidth="1.5"/>
-            })}
-          </svg>
-          {tasks.map(task=>{
-            const pos=positions.get(task.id)
-            if(!pos) return null
-            const isLeaf=!tasks.some(t=>t.parentId===task.id)
-            const pathE=pathEffortMap.get(task.id)??0
-            const isMinLeaf=isLeaf&&pathE===minE&&minE>0
-            const isMaxLeaf=isLeaf&&pathE===maxE&&maxE>0&&minE!==maxE
-            const ec=EFFORT_CONFIG[task.effort]
-            const td=!task.completed&&!!task.dueDate&&isToday(task.dueDate)
-            return (
-              <div key={task.id}
-                draggable
-                onDragStart={()=>setDraggingId(task.id)}
-                onDragEnd={()=>{setDraggingId(null);setDropTargetId(null)}}
-                onDragOver={e=>{e.preventDefault();e.stopPropagation();setDropTargetId(task.id)}}
-                onDrop={e=>{e.stopPropagation();handleDrop(task.id)}}
-                style={{position:'absolute',left:pos.x,top:pos.y,width:NODE_W,height:NODE_H}}
-                className={['bg-white rounded-lg border-2 cursor-grab select-none flex flex-col overflow-hidden',
-                  dropTargetId===task.id?'border-navy bg-navy/5 shadow-md':'',
-                  draggingId===task.id?'opacity-40 border-gray-200':'border-gray-200 shadow-sm hover:shadow',
-                  isMinLeaf?'ring-2 ring-green-400':'',isMaxLeaf?'ring-2 ring-red-300':'',
-                  td?'border-red-500':'',
-                ].join(' ')}
-              >
-                {td&&<div className="bg-red-500 text-white text-xs font-bold px-2 py-0.5 flex items-center gap-1"><span>🔥</span>今日締め切り</div>}
-                <div className="p-2.5 flex flex-col gap-1 flex-1 justify-between">
-                  <div className="flex items-start gap-1.5">
-                    <p className="text-xs font-semibold text-gray-800 flex-1 leading-tight line-clamp-2">{task.title}</p>
-                    {task.effort>0&&<span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 font-medium ${ec.color}`}>{ec.short}</span>}
-                  </div>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    {task.assignee!==DEFAULT_ASSIGNEE&&<span className="text-xs text-gray-400">→{task.assignee}</span>}
-                    {task.dueDate&&<span className={`text-xs flex items-center gap-0.5 ${td?'text-red-500':isOverdue(task.dueDate)?'text-red-400':'text-gray-400'}`}><Calendar size={10}/>{fmtDate(task.dueDate)}{task.dueTime?' '+task.dueTime:''}</span>}
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className={`text-xs font-medium ${isMinLeaf?'text-green-600':isMaxLeaf?'text-red-500':'text-gray-400'}`}>
-                      {pathE>0?`パス ${pathE}`:''}{isMinLeaf?' ✓最軽':isMaxLeaf?' ⚠最重':''}
-                    </span>
-                    <div className="flex gap-0.5">
-                      {task.parentId&&<button onPointerDown={e=>e.stopPropagation()} onClick={()=>onSetParent(task.id,null)} className="text-xs text-gray-300 hover:text-gray-600 px-1">↑外す</button>}
-                      <button onPointerDown={e=>e.stopPropagation()} onClick={()=>onEdit(task)} className="text-xs text-gray-300 hover:text-navy px-1">編集</button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )
-          })}
-        </div>
-      </div>
-      {leaves.length>1&&leafEfforts.length>0&&(
-        <div className="bg-white border border-gray-200 rounded-lg p-4">
-          <h3 className="text-sm font-semibold text-gray-700 mb-2">パス労力サマリー（末端タスク）</h3>
-          <div className="space-y-1.5">
-            {leaves.filter(l=>(pathEffortMap.get(l.id)??0)>0).sort((a,b)=>(pathEffortMap.get(a.id)??0)-(pathEffortMap.get(b.id)??0)).map(leaf=>{
-              const pe=pathEffortMap.get(leaf.id)??0
-              const isMin=pe===minE,isMax=pe===maxE&&minE!==maxE
-              return (
-                <div key={leaf.id} className="flex items-center gap-3">
-                  <span className={`text-xs w-2 h-2 rounded-full flex-shrink-0 ${isMin?'bg-green-400':isMax?'bg-red-400':'bg-gray-300'}`}/>
-                  <span className="text-xs text-gray-700 truncate flex-1">{leaf.title}</span>
-                  <div className="flex items-center gap-2 flex-shrink-0">
-                    <div className="w-24 bg-gray-100 rounded-full h-1.5">
-                      <div className={`h-1.5 rounded-full ${isMin?'bg-green-400':isMax?'bg-red-400':'bg-blue-300'}`} style={{width:`${maxE>0?Math.round((pe/maxE)*100):0}%`}}/>
-                    </div>
-                    <span className={`text-xs font-medium w-6 text-right ${isMin?'text-green-600':isMax?'text-red-500':'text-gray-500'}`}>{pe}</span>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )}
     </div>
   )
 }
@@ -1006,137 +1024,99 @@ interface GistSettingsModalProps {
 const GistSettingsModal: React.FC<GistSettingsModalProps> = ({
   settings, syncStatus, onSave, onDisconnect, onClose,
 }) => {
-  const [token,      setToken]      = useState(settings.githubToken)
-  const [gistId,     setGistId]     = useState(settings.gistId)
-  const [showToken,  setShowToken]  = useState(false)
-  const [testing,    setTesting]    = useState(false)
-  const [testMsg,    setTestMsg]    = useState<{ ok: boolean; text: string } | null>(null)
+  const [token, setToken] = useState(settings.githubToken)
+  const [gistId, setGistId] = useState(settings.gistId)
+  const [showToken, setShowToken] = useState(false)
+  const [checking, setChecking] = useState(false)
+  const [message, setMessage] = useState('')
 
-  const isConnected = !!settings.githubToken
-
-  const handleConnect = async () => {
-    if (!token.trim()) return
-    setTesting(true); setTestMsg(null)
-    const username = await gistValidateToken(token.trim())
-    if (username) {
-      setTestMsg({ ok: true, text: `✅ 接続成功（${username}）` })
-      onSave(token.trim(), gistId.trim())
-    } else {
-      setTestMsg({ ok: false, text: '❌ トークンが無効です。スコープに gist が含まれているか確認してください。' })
+  const handleSave = async () => {
+    const trimmedToken = token.trim()
+    if (!trimmedToken) {
+      setMessage('GitHub tokenを入力してください')
+      return
     }
-    setTesting(false)
+
+    setChecking(true)
+    setMessage('')
+    const username = await gistValidateToken(trimmedToken)
+    setChecking(false)
+    if (!username) {
+      setMessage('GitHub tokenを確認できませんでした')
+      return
+    }
+
+    onSave(trimmedToken, gistId.trim())
+    setMessage(`${username} と接続しました`)
   }
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-lg shadow-xl w-full max-w-md">
-
-        {/* ヘッダー */}
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-lg">
         <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
           <div className="flex items-center gap-2">
             <Cloud size={18} className="text-navy"/>
-            <h2 className="font-semibold text-gray-800">GitHub Gist 連携</h2>
+            <h2 className="font-semibold text-gray-800">GitHub Gist 設定</h2>
           </div>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1"><X size={18}/></button>
         </div>
 
         <div className="px-6 py-5 space-y-4">
-
-          {/* 接続中ステータス */}
-          {isConnected && (
-            <div className="bg-green-50 border border-green-200 rounded-lg px-4 py-3 text-sm">
-              <p className="font-medium text-green-700">✅ 接続中</p>
-              {settings.gistId && (
-                <p className="text-xs text-green-600 mt-0.5">
-                  Gist ID: <a href={`https://gist.github.com/${settings.gistId}`} target="_blank" rel="noreferrer"
-                    className="underline">{settings.gistId}</a>
-                </p>
-              )}
-              {settings.lastSynced && (
-                <p className="text-xs text-green-600 mt-0.5">最終同期: {fmtDateTime(settings.lastSynced)}</p>
-              )}
-              <p className="text-xs text-green-600 mt-0.5">
-                ステータス: {syncStatus === 'syncing' ? '同期中...' : syncStatus === 'error' ? '同期エラー' : '正常'}
-              </p>
-            </div>
-          )}
-
-          {/* トークン作成手順 */}
-          {!isConnected && (
-            <div className="bg-blue-50 border border-blue-100 rounded-lg px-4 py-3 text-xs text-blue-700 space-y-1.5">
-              <p className="font-bold text-sm">Personal Access Token の取得手順</p>
-              <ol className="list-decimal list-inside space-y-1 text-blue-600">
-                <li>GitHub → Settings → Developer settings</li>
-                <li>Personal access tokens → Tokens (classic)</li>
-                <li>「Generate new token」をクリック</li>
-                <li>スコープは <code className="bg-blue-100 px-1 rounded font-mono">gist</code> のみ選択（最小権限）</li>
-                <li>生成されたトークンをコピーして以下に貼り付け</li>
-              </ol>
-            </div>
-          )}
-
-          {/* トークン入力 */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1.5">
-              Personal Access Token
-            </label>
-            <div className="flex gap-2 items-center">
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">GitHub token</label>
+            <div className="flex gap-2">
               <input
                 type={showToken ? 'text' : 'password'}
                 value={token}
-                onChange={e => { setToken(e.target.value); setTestMsg(null) }}
-                placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
-                className="flex-1 border border-gray-200 rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-navy"
+                onChange={e=>setToken(e.target.value)}
+                placeholder="gist 権限つき token"
+                className="flex-1 min-w-0 border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy"
               />
-              <button onClick={() => setShowToken(v => !v)} className="text-gray-400 hover:text-gray-600 p-1">
+              <button
+                type="button"
+                onClick={()=>setShowToken(v=>!v)}
+                className="w-10 border border-gray-200 rounded-md flex items-center justify-center text-gray-500 hover:text-gray-700"
+                title={showToken ? '非表示' : '表示'}
+              >
                 {showToken ? <EyeOff size={16}/> : <Eye size={16}/>}
               </button>
             </div>
-            <p className="text-xs text-amber-600 mt-1">
-              ⚠️ トークンはこの端末の localStorage に保存されます（gistスコープのみ付与で被害を最小化）
-            </p>
           </div>
 
-          {/* 既存 Gist ID（2台目用） */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1.5">
-              既存の Gist ID
-              <span className="ml-1.5 text-xs text-gray-400 font-normal">2台目以降はここに入力 / 空白なら自動作成</span>
-            </label>
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">Gist ID</label>
             <input
               type="text"
               value={gistId}
-              onChange={e => setGistId(e.target.value)}
-              placeholder="例: a1b2c3d4e5f6... （1台目のGist設定画面で確認）"
-              className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-navy"
+              onChange={e=>setGistId(e.target.value)}
+              placeholder="空欄なら初回同期時に自動作成"
+              className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-navy"
             />
           </div>
 
-          {/* テスト結果 */}
-          {testMsg && (
-            <p className={`text-sm leading-snug ${testMsg.ok ? 'text-green-600' : 'text-red-500'}`}>
-              {testMsg.text}
-            </p>
-          )}
+          <div className="text-xs text-gray-500 bg-gray-50 rounded px-3 py-2">
+            状態: {syncStatus==='syncing' ? '同期中' : syncStatus==='success' ? '同期済み' : syncStatus==='error' ? '同期失敗' : settings.githubToken ? '接続中' : '未設定'}
+            {settings.lastSynced && <span> / 最終同期: {fmtDateTime(settings.lastSynced)}</span>}
+          </div>
+
+          {message && <p className="text-xs text-gray-500">{message}</p>}
         </div>
 
-        {/* フッター */}
         <div className="flex items-center justify-between px-6 py-4 border-t border-gray-100">
-          <div>
-            {isConnected && (
-              <button onClick={() => { onDisconnect(); onClose() }}
-                className="text-xs text-gray-400 hover:text-red-500 transition-colors">
-                連携を解除
-              </button>
-            )}
-          </div>
-          <div className="flex gap-2">
-            <button onClick={onClose} className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700">
-              {isConnected ? '閉じる' : 'キャンセル'}
-            </button>
-            <button onClick={handleConnect} disabled={!token.trim() || testing}
-              className="px-4 py-2 text-sm bg-navy text-white rounded-md hover:bg-navy-dark disabled:opacity-40 disabled:cursor-not-allowed">
-              {testing ? '確認中...' : isConnected ? 'トークンを更新' : '接続'}
+          <button
+            onClick={()=>{ onDisconnect(); setToken(''); setGistId(''); setMessage('接続を解除しました') }}
+            className="text-xs text-gray-400 hover:text-red-500 transition-colors"
+          >
+            接続を解除
+          </button>
+          <div className="flex justify-end gap-2">
+            <button onClick={onClose} className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700">閉じる</button>
+            <button
+              onClick={handleSave}
+              disabled={checking}
+              className="px-4 py-2 text-sm bg-navy text-white rounded-md hover:bg-navy-dark disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {checking ? '確認中...' : '保存'}
             </button>
           </div>
         </div>
@@ -1315,6 +1295,7 @@ export default function App() {
   const [isLoaded,       setIsLoaded]       = useState(false)
   const [filter,         setFilter]         = useState<Filter>('all')
   const [viewMode,       setViewMode]       = useState<ViewMode>('list')
+  const [boardGroupMode, setBoardGroupMode] = useState<BoardGroupMode>('assignee')
   const [showModal,      setShowModal]      = useState(false)
   const [editTask,       setEditTask]       = useState<Task|null>(null)
   const [deleteId,       setDeleteId]       = useState<string|null>(null)
@@ -1339,16 +1320,8 @@ export default function App() {
         try {
           const data = await gistLoad(s.githubToken, s.gistId)
           if (data) {
-            setTasks((data.tasks ?? []).map(t => ({
-              ...t,
-              memo:        (t as Task).memo        ?? '',
-              dueTime:     (t as Task).dueTime     ?? '',
-              parentId:    (t as Task).parentId    ?? null,
-              effort:      (t as Task).effort      ?? 0,
-              completedAt: (t as Task).completedAt ?? null,
-              assignee:    (t as Task).assignee    ?? DEFAULT_ASSIGNEE,
-            })))
-            setHistory(data.history ?? [])
+            setTasks((data.tasks ?? []).map(t => normalizeTask(t)))
+            setHistory(pruneHistory(data.history ?? []))
             setColumnOrder(data.columnOrder ?? [])
             setSyncStatus('success')
             setTimeout(() => setSyncStatus('idle'), 2000)
@@ -1369,6 +1342,28 @@ export default function App() {
     }
     doLoad()
   }, [])
+
+  // 完了から2週間経ったタスクを棚卸削除し、履歴に残す
+  useEffect(() => {
+    if (!isLoaded) return
+    const cutoff = new Date()
+    cutoff.setDate(cutoff.getDate() - COMPLETED_RETENTION_DAYS)
+    const expired = tasks.filter(t => t.completed && t.completedAt && new Date(t.completedAt) < cutoff)
+    if (!expired.length) return
+
+    setTasks(prev => prev.filter(t => !expired.some(e => e.id === t.id)))
+    setHistory(prev => pruneHistory([
+      ...expired.map(task => ({
+        id: genId(),
+        timestamp: new Date().toISOString(),
+        action: 'autoDeleted' as HistoryAction,
+        taskId: task.id,
+        taskTitle: task.title,
+        detail: `完了から${COMPLETED_RETENTION_DAYS}日経過`,
+      })),
+      ...prev,
+    ]))
+  }, [tasks, isLoaded])
 
   // localStorage への保存
   useEffect(() => {
@@ -1404,13 +1399,13 @@ export default function App() {
     return () => { if (syncTimer.current) clearTimeout(syncTimer.current) }
   }, [tasks, history, columnOrder, isLoaded])
 
-  // 履歴エントリを先頭に追加（上限超えたら古いものを削除）
+  // 履歴エントリを先頭に追加し、1週間より古い履歴を削除
   const addHistory = (action: HistoryAction, task: Task, detail?: string) => {
     const entry: HistoryEntry = {
       id: genId(), timestamp: new Date().toISOString(),
       action, taskId: task.id, taskTitle: task.title, detail,
     }
-    setHistory(prev => [entry, ...prev].slice(0, MAX_HISTORY))
+    setHistory(prev => pruneHistory([entry, ...prev]))
   }
 
   // Gist 接続
@@ -1431,10 +1426,10 @@ export default function App() {
     ...Array.from(new Set(tasks.map(t=>t.assignee).filter((a):a is string=>!!a&&a!==DEFAULT_ASSIGNEE))).sort()
   ]
 
-  const todayTasks       = tasks.filter(t=>t.isToday)
+  const todayTasks       = sortTasksForWork(tasks.filter(t=>t.isToday))
   const todayActiveCount = todayTasks.filter(t=>!t.completed).length
 
-  const allSectionTasks = tasks.filter(t=>{
+  const allSectionTasks = sortTasksForWork(tasks.filter(t=>{
     if(t.isToday) return false
     switch(filter){
       case 'today':    return !!t.dueDate&&isToday(t.dueDate)
@@ -1442,7 +1437,7 @@ export default function App() {
       case 'overdue':  return !t.completed&&!!t.dueDate&&isOverdue(t.dueDate)
       default:         return true
     }
-  })
+  }))
 
   const handleSave = (task: Task) => {
     const isNew = !tasks.find(t => t.id === task.id)
@@ -1482,15 +1477,14 @@ export default function App() {
     setDeleteId(null)
   }
 
-  const handleReorderTasks   = (newTasks: Task[])   => setTasks(newTasks)
-  const handleReorderColumns = (newOrder: string[]) => setColumnOrder(newOrder)
-
-  const handleSetParent = (taskId: string, parentId: string | null) => {
-    const task   = tasks.find(t => t.id === taskId)
-    const parent = parentId ? tasks.find(t => t.id === parentId) : null
-    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, parentId } : t))
-    if (task) addHistory('parentChanged', task, parent ? `親: 「${parent.title}」` : 'ルートに変更')
+  const handleReorderTasks = (visibleTasks: Task[]) => {
+    setTasks(prev => {
+      const visibleIds = new Set(visibleTasks.map(t => t.id))
+      const mergedVisible = visibleTasks.map(t => prev.find(p => p.id === t.id) ? t : t)
+      return [...mergedVisible, ...prev.filter(t => !visibleIds.has(t.id))]
+    })
   }
+  const handleReorderColumns = (newOrder: string[]) => setColumnOrder(newOrder)
 
   const cardProps = {
     onComplete:handleComplete, onToday:handleToday,
@@ -1547,16 +1541,16 @@ export default function App() {
                 </span>
               )}
             </button>
-            {/* ビュー切替 */}
             <div className="flex rounded-md overflow-hidden border border-white/20">
               {([
-                {mode:'list'  as ViewMode, icon:<List size={14}/>,      label:'リスト'},
+                {mode:'list' as ViewMode, icon:<List size={14}/>, label:'リスト'},
                 {mode:'gantt' as ViewMode, icon:<BarChart2 size={14}/>, label:'ガント'},
-                {mode:'tree'  as ViewMode, icon:<GitBranch size={14}/>, label:'ツリー'},
-              ]).map(({mode,icon,label},i)=>(
+              ]).map(({mode, icon, label}, i)=>(
                 <button key={mode} onClick={()=>setViewMode(mode)}
                   className={`flex items-center gap-1 px-2.5 py-1.5 text-sm transition-colors ${i>0?'border-l border-white/20':''} ${viewMode===mode?'bg-white/25':'hover:bg-white/10'}`}
-                  title={label}>{icon}<span className="hidden sm:inline text-xs">{label}</span></button>
+                  title={label}>
+                  {icon}<span className="hidden sm:inline text-xs">{label}</span>
+                </button>
               ))}
             </div>
             {/* エクスポート */}
@@ -1578,24 +1572,17 @@ export default function App() {
 
       <main className="max-w-7xl mx-auto px-4 py-6 space-y-6">
 
-        {/* ガントビュー */}
-        {viewMode==='gantt' && (
+        {viewMode === 'gantt' && (
           <section>
-            <div className="mb-4"><h2 className="font-semibold text-gray-800">ガントチャート</h2><p className="text-xs text-gray-500 mt-0.5">全タスクの期限・進捗を時系列で確認</p></div>
+            <div className="mb-4">
+              <h2 className="font-semibold text-gray-800">ガントチャート</h2>
+              <p className="text-xs text-gray-500 mt-0.5">期限と現在ステップを時系列で確認</p>
+            </div>
             <GanttChart tasks={tasks}/>
           </section>
         )}
 
-        {/* ツリービュー */}
-        {viewMode==='tree' && (
-          <section>
-            <div className="mb-4"><h2 className="font-semibold text-gray-800">タスクツリー</h2><p className="text-xs text-gray-500 mt-0.5">親子関係・パス労力を可視化。ドラッグ&ドロップで依存関係を設定</p></div>
-            <TreeView tasks={tasks} onSetParent={handleSetParent} onEdit={handleEdit}/>
-          </section>
-        )}
-
-        {/* リストビュー */}
-        {viewMode==='list' && (
+        {viewMode === 'list' && (
           <>
             {/* 今日の3つ — 中央寄せ */}
             <section className="bg-gray-100 rounded-lg p-5 max-w-2xl mx-auto">
@@ -1614,7 +1601,21 @@ export default function App() {
             {/* 全タスク — 宛先別カラム・フル幅 */}
             <section>
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
-                <h2 className="font-semibold text-gray-800">全タスク</h2>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <h2 className="font-semibold text-gray-800">全タスク</h2>
+                  <div className="flex rounded-md overflow-hidden border border-gray-200 bg-white">
+                    {([
+                      {key:'assignee' as BoardGroupMode,label:'宛先'},
+                      {key:'priority' as BoardGroupMode,label:'優先度'},
+                      {key:'due' as BoardGroupMode,label:'完了時期'},
+                    ]).map((mode, i)=>(
+                      <button key={mode.key} onClick={()=>setBoardGroupMode(mode.key)}
+                        className={`text-xs px-3 py-1.5 transition-colors ${i>0?'border-l border-gray-200':''} ${boardGroupMode===mode.key?'bg-navy text-white':'text-gray-600 hover:bg-gray-50'}`}>
+                        {mode.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 <div className="flex gap-1 flex-wrap">
                   {([
                     {key:'all'      as Filter,label:'すべて'},
@@ -1631,6 +1632,7 @@ export default function App() {
               </div>
               <AssigneeCols
                 tasks={allSectionTasks}
+                groupMode={boardGroupMode}
                 knownAssignees={knownAssignees}
                 columnOrder={columnOrder}
                 onReorderTasks={handleReorderTasks}
@@ -1644,7 +1646,7 @@ export default function App() {
 
       {/* Modals */}
       {showModal && (
-        <TaskModal initial={editTask} allTasks={tasks} knownAssignees={knownAssignees}
+        <TaskModal initial={editTask} knownAssignees={knownAssignees}
           onSave={handleSave} onClose={()=>{setShowModal(false);setEditTask(null)}}/>
       )}
       {showTeachings && <TeachingsModal onClose={()=>setShowTeachings(false)}/>}
